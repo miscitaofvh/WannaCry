@@ -1,188 +1,226 @@
+#define _WINSOCK_DEPRECATED_NO_WARNINGS
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <iphlpapi.h>
 #include <iostream>
 #include <string>
 #include <vector>
+#include <map>
 #include <algorithm>
 
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "iphlpapi.lib")
 
 #define SIO_RCVALL _WSAIOW(IOC_VENDOR,1)
+#define MAX_PACKET_SIZE 65535
 
-std::vector<std::string> blockedIPs;
+#pragma pack(push, 1)
 
 struct IPHeader {
-    BYTE  ver_ihl;
-    BYTE  tos;
-    WORD  length;
-    WORD  id;
-    WORD  flags_fo;
-    BYTE  ttl;
-    BYTE  protocol;
-    WORD  checksum;
-    DWORD src_addr;
-    DWORD dst_addr;
+    unsigned char  ver_ihl;        
+    unsigned char  tos;            
+    unsigned short total_len;      
+    unsigned short id;             
+    unsigned short flags_fo;       
+    unsigned char  ttl;            
+    unsigned char  protocol;       
+    unsigned short checksum;       
+    struct in_addr srcAddr;        
+    struct in_addr destAddr;       
 };
 
 struct TCPHeader {
-    WORD  src_port;
-    WORD  dst_port;
-    DWORD seq_num;
-    DWORD ack_num;
-    BYTE  data_offset;
-    BYTE  flags;
-    WORD  window;
-    WORD  checksum;
-    WORD  urgent_ptr;
+    unsigned short src_port;
+    unsigned short dst_port;
+    unsigned int   sequence;
+    unsigned int   ack;
+    unsigned char  data_offset;  
+    unsigned char  flags;
+    unsigned short window;
+    unsigned short checksum;
+    unsigned short urgent_ptr;
 };
+
+// Cấu trúc NetBIOS Session Header (4 bytes đầu tiên của payload TCP)
+struct NetBIOS_Header {
+    unsigned char  Type;      // 0x00 = Message
+    unsigned char  Length[3]; // Big Endian Length (24 bits)
+};
+
+// Cấu trúc SMB Header chuẩn (bắt đầu sau NetBIOS)
+struct SMB_Header {
+    unsigned char  Protocol[4];   // 0xFF 'S' 'M' 'B'
+    unsigned char  Command;       // 0x32 hoặc 0x33
+    unsigned int   Status;
+    unsigned char  Flags;
+    unsigned short Flags2;
+    unsigned short PIDHigh;
+    unsigned char  Signature[8];
+    unsigned short Reserved;
+    unsigned short TID;
+    unsigned short PID;
+    unsigned short UID;
+    unsigned short MID;
+};
+#pragma pack(pop)
+
+std::vector<std::string> activeBlockRules; // Lưu danh sách các IP đã block để tí nữa xóa
+bool isRunning = true;
+
+// Hàm lấy giá trị 24-bit big endian từ NetBIOS Header
+unsigned int getNetBIOSLength(unsigned char* lenPtr) {
+    return (lenPtr[0] << 16) | (lenPtr[1] << 8) | (lenPtr[2]);
+}
 
 void RemoveBlockRule(const std::string& ipAddress) {
     std::string ruleName = "BLOCK_ETERNALBLUE_" + ipAddress;
+    // Lệnh xóa rule trong Windows Firewall
     std::string cmd = "netsh advfirewall firewall delete rule name=\"" + ruleName + "\"";
     WinExec(cmd.c_str(), SW_HIDE);
-    std::cout << "[INFO] Removed block rule for IP: " << ipAddress << std::endl;
-}
-
-void BlockAttacker(const std::string& ipAddress) {
-    for (const auto& ip : blockedIPs) {
-        if (ip == ipAddress) return;
-    }
-
-    std::cout << "\n[!!!] ATTACK DETECTED! -> BLOCKING IP: " << ipAddress << std::endl;
-    
-    std::string ruleName = "BLOCK_ETERNALBLUE_" + ipAddress;
-    std::string cmd = "netsh advfirewall firewall add rule name=\"" + ruleName + "\" dir=in action=block remoteip=" + ipAddress;
-    WinExec(cmd.c_str(), SW_HIDE);
-
-    blockedIPs.push_back(ipAddress);
+    std::cout << "[CLEANUP] Da go bo rule chan IP: " << ipAddress << std::endl;
 }
 
 BOOL WINAPI ConsoleHandler(DWORD signal) {
     if (signal == CTRL_C_EVENT || signal == CTRL_CLOSE_EVENT) {
-        std::cout << "\n[INFO] Shutting down... Cleaning up Firewall rules..." << std::endl;
-        for (const auto& ip : blockedIPs) {
+        std::cout << "\n\n[INFO] Dang tat chuong trinh... Dang xoa cac rule Firewall..." << std::endl;
+        isRunning = false;
+        
+        // Duyệt qua danh sách đã chặn và xóa hết
+        for (const auto& ip : activeBlockRules) {
             RemoveBlockRule(ip);
         }
-        std::cout << "[INFO] Cleanup complete. Exiting now." << std::endl;
-        Sleep(500); 
-        ExitProcess(0); 
+        std::cout << "[INFO] Hoan tat. Bye bye!" << std::endl;
+        Sleep(1000);
+        ExitProcess(0);
     }
     return TRUE;
 }
 
-bool DetectEternalBlueSignature(const char* payload, int size) {
-    if (size < 100) return false;
-
-    bool isSMB = false;
-    for(int i=0; i < size - 4 && i < 64; i++) {
-        if ((payload[i] == 0xFF || payload[i] == 0xFE) && 
-            payload[i+1] == 'S' && payload[i+2] == 'M' && payload[i+3] == 'B') {
-            isSMB = true;
-            break;
-        }
+void BlockAttacker(const std::string& ipAddress) {
+    // Kiểm tra xem IP này đã bị chặn chưa (tránh chặn 2 lần)
+    for (const auto& ruleIP : activeBlockRules) {
+        if (ruleIP == ipAddress) return;
     }
-    if (!isSMB) return false;
 
-    int consecutive_A = 0;
-    int consecutive_NOP = 0;
+    std::cout << "\n[!!!] BLOCKING IP: " << ipAddress << " (Phat hien tan cong qua 3 lan!)" << std::endl;
+    
+    std::string ruleName = "BLOCK_ETERNALBLUE_" + ipAddress;
+    // Lệnh chặn chiều INBOUND từ IP cụ thể
+    std::string cmd = "netsh advfirewall firewall add rule name=\"" + ruleName + "\" dir=in action=block remoteip=" + ipAddress;
+    WinExec(cmd.c_str(), SW_HIDE);
 
-    for (int i = 0; i < size; i++) {
-        if (payload[i] == 0x41) consecutive_A++; else consecutive_A = 0;
-        if (payload[i] == 0x90) consecutive_NOP++; else consecutive_NOP = 0;
-
-        if (consecutive_A > 100 || consecutive_NOP > 100) {
-            return true;
-        }
-    }
-    return false;
+    activeBlockRules.push_back(ipAddress);
 }
 
-std::string GetLocalIP() {
-    char hostname[256];
-    if (gethostname(hostname, sizeof(hostname)) == SOCKET_ERROR) return "";
-    struct hostent* host = gethostbyname(hostname);
-    if (host) {
-        struct in_addr** addr_list = (struct in_addr**)host->h_addr_list;
-        for (int i = 0; addr_list[i] != NULL; i++) return inet_ntoa(*addr_list[i]);
+void analyzeSMB(unsigned char* payload, int payloadSize, struct in_addr srcAddr) {
+    // 1. Kiểm tra kích thước tối thiểu (NetBIOS 4 bytes + SMB Header 32 bytes)
+    if (payloadSize < 36) return; 
+
+    // 2. Kiểm tra NetBIOS Session Service (Byte đầu thường là 0x00)
+    // Và kiểm tra Magic SMB: 0xFF 'S' 'M' 'B' tại offset 4
+    if (payload[4] != 0xFF || payload[5] != 'S' || payload[6] != 'M' || payload[7] != 'B') {
+        return; // Không phải SMB packet chuẩn
     }
-    return "";
+
+    // Parse Headers
+    NetBIOS_Header* nbHeader = (NetBIOS_Header*)payload;
+    SMB_Header* smbHeader = (SMB_Header*)(payload + 4);
+    
+    unsigned int netBIOSLen = getNetBIOSLength(nbHeader->Length);
+    unsigned char command = smbHeader->Command;
+
+    if (command == 0xA0) {
+        
+        // Word Count (WCT) nằm ngay sau SMB Header (offset 4 + 32 = 36)
+        int wctOffset = 36;
+        int totalDataCountOffset = 44;
+
+        if (payloadSize < totalDataCountOffset + 4) return; // Không đủ dữ liệu để đọc
+
+        // Đọc 4 bytes TotalDataCount (Lưu ý: Little Endian trong SMB)
+        unsigned int* pTotalDataCount = (unsigned int*)(payload + totalDataCountOffset);
+        unsigned int totalDataCount = *pTotalDataCount;
+
+        if (totalDataCount > netBIOSLen) {
+            std::string attackerIP = inet_ntoa(srcAddr);
+            
+            std::cout << "\n[!!!] ALERT: MALICIOUS SMB PACKET DETECTED (NT_TRANSACT 0xA0)" << std::endl;
+            std::cout << "      Src IP: " << attackerIP << std::endl;
+            std::cout << "      [+] NetBIOS Length (Real): " << netBIOSLen << " bytes" << std::endl;
+            std::cout << "      [+] Total Data Count (Fake): " << totalDataCount << " bytes" << std::endl;
+            std::cout << "      [!] DISCREPANCY: Payload is too small for requested allocation!" << std::endl;
+            
+            BlockAttacker(attackerIP);
+        } 
+
+        std::cout << "--------------------------------------------------------" << std::endl;
+    }
 }
 
 int main() {
     if (!SetConsoleCtrlHandler(ConsoleHandler, TRUE)) {
-        std::cerr << "Error: Could not set console control handler.\n";
+        std::cerr << "Loi: Khong the dang ky Console Handler.\n";
         return 1;
     }
-
-    std::cout << "=================================================\n";
-    std::cout << "   ANTI-ETERNALBLUE DEMO (Auto Cleanup Mode)     \n";
-    std::cout << "=================================================\n";
-
-    system("netsh advfirewall firewall delete rule name=all | findstr \"BLOCK_ETERNALBLUE_\" > nul");
 
     WSADATA wsaData;
+    SOCKET sniffSocket;
+    char hostname[100];
+    struct hostent* local;
+    struct sockaddr_in dest;
+    char* buffer = new char[MAX_PACKET_SIZE];
+    int count = 0;
+
     if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) return 1;
 
-    SOCKET sniffer = socket(AF_INET, SOCK_RAW, IPPROTO_IP);
-    if (sniffer == INVALID_SOCKET) {
-        std::cerr << "[-] Error: Run as Administrator!\n";
-        system("pause");
+    sniffSocket = socket(AF_INET, SOCK_RAW, IPPROTO_IP);
+    if (sniffSocket == INVALID_SOCKET) return 1;
+
+    gethostname(hostname, sizeof(hostname));
+    local = gethostbyname(hostname);
+    struct in_addr addr;
+    memcpy(&addr, local->h_addr_list[0], sizeof(struct in_addr));
+    std::cout << "[*] Monitoring SMB (0x32 & 0x33) on: " << inet_ntoa(addr) << std::endl;
+
+    memset(&dest, 0, sizeof(dest));
+    dest.sin_family = AF_INET;
+    dest.sin_addr.s_addr = addr.s_addr;
+    dest.sin_port = 0;
+
+    if (bind(sniffSocket, (struct sockaddr*)&dest, sizeof(dest)) == SOCKET_ERROR) {
         return 1;
     }
 
-    std::string myIP = GetLocalIP();
-    if (myIP.empty()) return 1;
-    
-    sockaddr_in local;
-    local.sin_family = AF_INET;
-    local.sin_addr.s_addr = inet_addr(myIP.c_str());
-    local.sin_port = 0;
+    DWORD dwBufferIn = 1; 
+    DWORD dwBufferOut;
+    WSAIoctl(sniffSocket, SIO_RCVALL, &dwBufferIn, sizeof(dwBufferIn), 0, 0, &dwBufferOut, 0, 0);
 
-    if (bind(sniffer, (sockaddr*)&local, sizeof(local)) == SOCKET_ERROR) {
-        std::cerr << "[-] Bind failed. IP: " << myIP << "\n";
-        return 1;
-    }
-
-    DWORD j = 1;
-    ioctlsocket(sniffer, SIO_RCVALL, &j);
-
-    std::cout << "[+] Protecting: " << myIP << "\n";
-    std::cout << "[+] Status: READY TO BLOCK ATTACKS.\n";
-    std::cout << "[!] Closing this program will DISABLE protection.\n\n";
-
-    char buffer[65536];
     while (true) {
-        int size = recv(sniffer, buffer, sizeof(buffer), 0);
-        if (size > 0) {
+        int bytesRead = recv(sniffSocket, buffer, MAX_PACKET_SIZE, 0);
+        
+        if (bytesRead > 0) {
             IPHeader* ipHeader = (IPHeader*)buffer;
-            int ipHeaderLen = (ipHeader->ver_ihl & 0x0F) * 4;
+            
+            unsigned short ipHeaderLen = (ipHeader->ver_ihl & 0x0F) * 4;
+            unsigned char* ipPayload = (unsigned char*)buffer + ipHeaderLen;
+            int ipPayloadTotalSize = bytesRead - ipHeaderLen;
 
-            if (ipHeader->protocol == IPPROTO_TCP) {
-                TCPHeader* tcpHeader = (TCPHeader*)(buffer + ipHeaderLen);
-                int portDst = ntohs(tcpHeader->dst_port);
-
-                if (portDst == 445) {
-                    int tcpHeaderLen = ((tcpHeader->data_offset >> 4) * 4);
-                    char* payload = buffer + ipHeaderLen + tcpHeaderLen;
-                    int payloadSize = size - ipHeaderLen - tcpHeaderLen;
-
-                    if (payloadSize > 0) {
-                        if (DetectEternalBlueSignature(payload, payloadSize)) {
-                            in_addr addr;
-                            addr.s_addr = ipHeader->src_addr;
-                            std::string attackerIP = inet_ntoa(addr);
-                            
-                            BlockAttacker(attackerIP);
-                        }
-                    }
+            if (ipHeader->destAddr.s_addr == addr.s_addr && ipHeader->protocol == IPPROTO_TCP) {
+                TCPHeader* tcpHeader = (TCPHeader*)ipPayload;
+                unsigned short tcpHeaderLen = (tcpHeader->data_offset >> 4) * 4;
+                
+                unsigned char* appData = ipPayload + tcpHeaderLen;
+                int appDataSize = ipPayloadTotalSize - tcpHeaderLen;
+                
+                if (appDataSize > 0) {
+                    analyzeSMB(appData, appDataSize, ipHeader->srcAddr);
                 }
             }
         }
     }
 
-    closesocket(sniffer);
+    delete[] buffer;
+    closesocket(sniffSocket);
     WSACleanup();
     return 0;
 }
