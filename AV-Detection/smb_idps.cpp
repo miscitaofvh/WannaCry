@@ -97,19 +97,33 @@ BOOL WINAPI ConsoleHandler(DWORD signal) {
 }
 
 void BlockAttacker(const std::string& ipAddress) {
-    // Kiểm tra xem IP này đã bị chặn chưa (tránh chặn 2 lần)
+    // 1. Kiểm tra xem IP đã có trong danh sách bộ nhớ chưa
     for (const auto& ruleIP : activeBlockRules) {
         if (ruleIP == ipAddress) return;
     }
 
-    std::cout << "\n[!!!] BLOCKING IP: " << ipAddress << " (Phat hien tan cong qua 3 lan!)" << std::endl;
+    std::cout << "\n[!!!] BLOCKING IP: " << ipAddress << "..." << std::endl;
     
     std::string ruleName = "BLOCK_ETERNALBLUE_" + ipAddress;
-    // Lệnh chặn chiều INBOUND từ IP cụ thể
-    std::string cmd = "netsh advfirewall firewall add rule name=\"" + ruleName + "\" dir=in action=block remoteip=" + ipAddress;
-    WinExec(cmd.c_str(), SW_HIDE);
+    
+    // 2. Cập nhật câu lệnh Netsh mạnh mẽ hơn (profile=any, enable=yes)
+    // Dùng stringstream hoặc cộng chuỗi cẩn thận
+    std::string cmd = "netsh advfirewall firewall add rule name=\"" + ruleName + 
+                      "\" dir=in action=block remoteip=" + ipAddress + 
+                      " protocol=any enable=yes profile=any";
 
-    activeBlockRules.push_back(ipAddress);
+    // 3. Sử dụng system() để thực thi. 
+    // Lưu ý: system() sẽ trả về 0 nếu thành công.
+    int result = system(cmd.c_str());
+
+    // 4. Chỉ thêm vào danh sách activeBlockRules NẾU lệnh chặn thành công
+    if (result == 0) {
+        std::cout << "[+] SUCCESS: IP " << ipAddress << " has been blocked in Windows Firewall." << std::endl;
+        activeBlockRules.push_back(ipAddress);
+    } else {
+        std::cout << "[-] FAILED: Could not add firewall rule. Run as Administrator!" << std::endl;
+        // KHÔNG thêm vào activeBlockRules để lần sau nó thử chặn lại
+    }
 }
 
 void analyzeSMB(unsigned char* payload, int payloadSize, struct in_addr srcAddr) {
