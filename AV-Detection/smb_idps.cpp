@@ -41,16 +41,14 @@ struct TCPHeader {
     unsigned short urgent_ptr;
 };
 
-// Cấu trúc NetBIOS Session Header (4 bytes đầu tiên của payload TCP)
 struct NetBIOS_Header {
-    unsigned char  Type;      // 0x00 = Message
-    unsigned char  Length[3]; // Big Endian Length (24 bits)
+    unsigned char  Type;     
+    unsigned char  Length[3]; 
 };
 
-// Cấu trúc SMB Header chuẩn (bắt đầu sau NetBIOS)
 struct SMB_Header {
     unsigned char  Protocol[4];   // 0xFF 'S' 'M' 'B'
-    unsigned char  Command;       // 0x32 hoặc 0x33
+    unsigned char  Command;       // 0x32 or 0x33
     unsigned int   Status;
     unsigned char  Flags;
     unsigned short Flags2;
@@ -64,32 +62,27 @@ struct SMB_Header {
 };
 #pragma pack(pop)
 
-std::vector<std::string> activeBlockRules; // Lưu danh sách các IP đã block để tí nữa xóa
+std::vector<std::string> activeBlockRules;
 bool isRunning = true;
 
-// Hàm lấy giá trị 24-bit big endian từ NetBIOS Header
 unsigned int getNetBIOSLength(unsigned char* lenPtr) {
     return (lenPtr[0] << 16) | (lenPtr[1] << 8) | (lenPtr[2]);
 }
 
 void RemoveBlockRule(const std::string& ipAddress) {
     std::string ruleName = "BLOCK_ETERNALBLUE_" + ipAddress;
-    // Lệnh xóa rule trong Windows Firewall
     std::string cmd = "netsh advfirewall firewall delete rule name=\"" + ruleName + "\"";
     WinExec(cmd.c_str(), SW_HIDE);
-    std::cout << "[CLEANUP] Da go bo rule chan IP: " << ipAddress << std::endl;
 }
 
 BOOL WINAPI ConsoleHandler(DWORD signal) {
     if (signal == CTRL_C_EVENT || signal == CTRL_CLOSE_EVENT) {
-        std::cout << "\n\n[INFO] Dang tat chuong trinh... Dang xoa cac rule Firewall..." << std::endl;
         isRunning = false;
         
-        // Duyệt qua danh sách đã chặn và xóa hết
         for (const auto& ip : activeBlockRules) {
             RemoveBlockRule(ip);
         }
-        std::cout << "[INFO] Hoan tat. Bye bye!" << std::endl;
+        std::cout << "[INFO] Done. Bye bye!" << std::endl;
         Sleep(1000);
         ExitProcess(0);
     }
@@ -97,7 +90,6 @@ BOOL WINAPI ConsoleHandler(DWORD signal) {
 }
 
 void BlockAttacker(const std::string& ipAddress) {
-    // 1. Kiểm tra xem IP đã có trong danh sách bộ nhớ chưa
     for (const auto& ruleIP : activeBlockRules) {
         if (ruleIP == ipAddress) return;
     }
@@ -106,34 +98,25 @@ void BlockAttacker(const std::string& ipAddress) {
     
     std::string ruleName = "BLOCK_ETERNALBLUE_" + ipAddress;
     
-    // 2. Cập nhật câu lệnh Netsh mạnh mẽ hơn (profile=any, enable=yes)
-    // Dùng stringstream hoặc cộng chuỗi cẩn thận
     std::string cmd = "netsh advfirewall firewall add rule name=\"" + ruleName + 
                       "\" dir=in action=block remoteip=" + ipAddress + 
                       " protocol=any enable=yes profile=any";
 
-    // 3. Sử dụng system() để thực thi. 
-    // Lưu ý: system() sẽ trả về 0 nếu thành công.
     int result = system(cmd.c_str());
 
-    // 4. Chỉ thêm vào danh sách activeBlockRules NẾU lệnh chặn thành công
     if (result == 0) {
         std::cout << "[+] SUCCESS: IP " << ipAddress << " has been blocked in Windows Firewall." << std::endl;
         activeBlockRules.push_back(ipAddress);
     } else {
         std::cout << "[-] FAILED: Could not add firewall rule. Run as Administrator!" << std::endl;
-        // KHÔNG thêm vào activeBlockRules để lần sau nó thử chặn lại
     }
 }
 
 void analyzeSMB(unsigned char* payload, int payloadSize, struct in_addr srcAddr) {
-    // 1. Kiểm tra kích thước tối thiểu (NetBIOS 4 bytes + SMB Header 32 bytes)
     if (payloadSize < 36) return; 
 
-    // 2. Kiểm tra NetBIOS Session Service (Byte đầu thường là 0x00)
-    // Và kiểm tra Magic SMB: 0xFF 'S' 'M' 'B' tại offset 4
     if (payload[4] != 0xFF || payload[5] != 'S' || payload[6] != 'M' || payload[7] != 'B') {
-        return; // Không phải SMB packet chuẩn
+        return;
     }
 
     // Parse Headers
@@ -144,14 +127,11 @@ void analyzeSMB(unsigned char* payload, int payloadSize, struct in_addr srcAddr)
     unsigned char command = smbHeader->Command;
 
     if (command == 0xA0) {
-        
-        // Word Count (WCT) nằm ngay sau SMB Header (offset 4 + 32 = 36)
         int wctOffset = 36;
         int totalDataCountOffset = 44;
 
-        if (payloadSize < totalDataCountOffset + 4) return; // Không đủ dữ liệu để đọc
+        if (payloadSize < totalDataCountOffset + 4) return; 
 
-        // Đọc 4 bytes TotalDataCount (Lưu ý: Little Endian trong SMB)
         unsigned int* pTotalDataCount = (unsigned int*)(payload + totalDataCountOffset);
         unsigned int totalDataCount = *pTotalDataCount;
 
@@ -173,7 +153,6 @@ void analyzeSMB(unsigned char* payload, int payloadSize, struct in_addr srcAddr)
 
 int main() {
     if (!SetConsoleCtrlHandler(ConsoleHandler, TRUE)) {
-        std::cerr << "Loi: Khong the dang ky Console Handler.\n";
         return 1;
     }
 
