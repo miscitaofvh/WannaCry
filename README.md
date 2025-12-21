@@ -14,7 +14,7 @@ The source code in `PoC-Simulation/` simulates the core behaviors of the WannaCr
 ### 2. Detection & Defense (IDPS)
 The `AV-Detection/` component focuses on monitoring and mitigating attacks at the network layer:
 * **SMB Traffic Monitoring**: Utilizes raw sockets to sniff and analyze SMB protocol traffic in real-time.
-* **EternalBlue Signature Detection**: Identifies malicious `NT_TRANSACT` (0xA0) packets by detecting discrepancies between the declared `Total Data Count` and the actual `NetBIOS Length`.
+* **EternalBlue Signature Detection**: Identifies malicious `NT_TRANSACT` (0xA0) packets by detecting discrepancies between the declared `Total Data Count` and the actual `NetBIOS Length`. **Logic incorporates Integer Overflow checks (>0xFFFF) based on the RiskSense technical analysis.**
 * **Automated Response**: Automatically blocks the attacker's IP address by dynamically adding a block rule to the Windows Firewall via `netsh` upon detection of an intrusion attempt.
 
 ### 3. Technical Research
@@ -24,8 +24,7 @@ The project includes deep-dive technical documentation regarding SMB and CIFS pr
 
 * `/PoC-Simulation`: Source code for the ransomware simulation and EternalBlue exploit module.
 * `/AV-Detection`: An Intrusion Detection and Prevention System (IDPS) specialized for SMB-based attacks.
-* `/Reseach-Papers`: Technical specifications for [MS-SMB] and [MS-CIFS] protocols.
-
+* `/Reseach-Papers`: Technical specifications for [MS-SMB], [MS-CIFS] protocols, and **EternalBlue Exploit Analysis (RiskSense)**.
 ## 🛠 Technical Requirements
 
 * **Language**: C++
