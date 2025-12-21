@@ -135,7 +135,7 @@ void analyzeSMB(unsigned char* payload, int payloadSize, struct in_addr srcAddr)
         unsigned int* pTotalDataCount = (unsigned int*)(payload + totalDataCountOffset);
         unsigned int totalDataCount = *pTotalDataCount;
 
-        if (totalDataCount > netBIOSLen) {
+        if (totalDataCount > netBIOSLen && totalDataCount > 0xFFFF) {
             std::string attackerIP = inet_ntoa(srcAddr);
             
             std::cout << "\n[!!!] ALERT: MALICIOUS SMB PACKET DETECTED (NT_TRANSACT 0xA0)" << std::endl;
